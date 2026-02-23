@@ -2,11 +2,15 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+# Project-wide static definitions for the synthetic network.
+# Centers are origins/destinations, parcel types are categories per lane.
 
 SORTING_CENTERS = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
 PARCEL_TYPES = ["typeA", "typeB"]
 
 
+# Baseline mean parcel volume matrix:
+# rows = origin center, columns = destination center (excluding self-destination).
 AVERAGE_VOL_DEST = np.array(
     [
         [220, 350, 400, 610, 500, 390, 530, 280, 310],
@@ -23,6 +27,7 @@ AVERAGE_VOL_DEST = np.array(
 )
 
 
+# Cumulative fraction ranges used to distribute each parcel type during the day.
 HOUR_EVOLUTION_DICT = {
     "typeA": [[0.40, 0.70], [0.70, 0.90]],
     "typeB": [[0.40, 0.60], [0.60, 0.70], [0.70, 0.80], [0.80, 0.90]],
@@ -31,6 +36,7 @@ HOUR_EVOLUTION_DICT = {
 
 @dataclass
 class SimulationConfig:
+    """Runtime knobs for dataset generation."""
     n_weeks: int = 100
     n_weeks_high_season: int = 10
     n_parcels_per_truck: int = 100
@@ -44,6 +50,7 @@ class SimulationConfig:
 
 
 def validate_shapes() -> None:
+    """Fail fast if static volume tables do not match network dimensions."""
     n_centers = len(SORTING_CENTERS)
     n_dest = n_centers - 1
     if AVERAGE_VOL_DEST.shape != (n_centers, n_dest):
@@ -51,6 +58,7 @@ def validate_shapes() -> None:
 
 
 def build_day_configuration() -> dict:
+    """Define season/day groups and scaling factors for average traffic."""
     f_low_season = 1.0
     f_high_season = 1.5
     f_mon = 1.2

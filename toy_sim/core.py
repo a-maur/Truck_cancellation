@@ -8,6 +8,7 @@ from config import (
     SORTING_CENTERS,
 )
 
+# Core simulation and feature-engineering utilities used by main.py.
 
 N_DEST = len(SORTING_CENTERS) - 1
 N_TYPES = len(PARCEL_TYPES)
@@ -15,10 +16,12 @@ N_HOURS = max(len(hour_ranges) for hour_ranges in HOUR_EVOLUTION_DICT.values()) 
 
 
 def destinations_for_origin(origin: str) -> list[str]:
+    """Return all destination centers reachable from an origin (exclude self)."""
     return [center for center in SORTING_CENTERS if center != origin]
 
 
 def build_average_vol_by_origin() -> dict[str, np.ndarray]:
+    """Split baseline lane volume into parcel-type volumes for each origin."""
     average_vol_by_origin: dict[str, np.ndarray] = {}
     for i_origin, origin in enumerate(SORTING_CENTERS):
         avg_dest = AVERAGE_VOL_DEST[i_origin]
@@ -32,6 +35,7 @@ AVERAGE_VOL_BY_ORIGIN = build_average_vol_by_origin()
 
 
 def uniform_corr_matrix(size: int, rho: float) -> np.ndarray:
+    """Create a constant-correlation matrix with unit diagonal."""
     corr = np.full((size, size), rho)
     np.fill_diagonal(corr, 1.0)
     return corr
@@ -44,6 +48,7 @@ def create_partially_correlated_dataset(
     corr_type: np.ndarray,
     n_days: int = 10_000,
 ) -> np.ndarray:
+    """Sample correlated daily parcel counts across (destination x parcel type)."""
     corr = np.kron(corr_dest, corr_type)
     cov = np.diag(sigma) @ corr @ np.diag(sigma)
     samples = np.random.multivariate_normal(mean=mu, cov=cov, size=n_days).astype(int)
@@ -58,6 +63,7 @@ def build_dataframe(
     n_days: int = 10_000,
     n_parcels_per_truck: int = 100,
 ) -> pd.DataFrame:
+    """Build per-origin daily dataframe with lane totals and expected trucks."""
     columns = []
     for dest in destinations_for_origin(origin):
         for parcel_type in PARCEL_TYPES:
@@ -99,6 +105,7 @@ def build_dataframe(
 def merge_df_all_days(
     dfs: list[pd.DataFrame], days: list[list[int]], shuffle: bool = False, random_state: int | None = None
 ) -> pd.DataFrame | None:
+    """Interleave day-group dataframes in round-robin chunks."""
     if len(dfs) != len(days):
         raise ValueError("dfs and days must have the same length")
     if not dfs:
@@ -126,6 +133,7 @@ def merge_df_all_days(
 def compute_last_truck_overflow_and_historical_averages(
     origin: str, df: pd.DataFrame, n_parcels_per_truck: int = 100, margin: float = 0.2
 ) -> pd.DataFrame:
+    """Compute overflow carry-over and historical statistics per destination/day."""
     for dest in destinations_for_origin(origin):
         df[f"{dest}_total2"] = df[f"{dest}_total"]
         df[f"{dest}_overflow"] = np.nan
@@ -170,6 +178,7 @@ def compute_last_truck_overflow_and_historical_averages(
 
 
 def calculate_hourly_volumes(n_days: int) -> list[np.ndarray]:
+    """Sample intraday cumulative volume profiles for each parcel type."""
     rng = np.random.default_rng()
     hour_evolution = []
 
@@ -188,6 +197,7 @@ def calculate_hourly_volumes(n_days: int) -> list[np.ndarray]:
 
 
 def add_hourly_volumes(df: pd.DataFrame, hour_evolution: list[np.ndarray]) -> pd.DataFrame:
+    """Add cumulative hourly volume columns (`vol_h*`) to the daily dataframe."""
     day_volume = (df["day_total2"].values - df["day_total"].values)[:, None]
     for i, he in enumerate(hour_evolution):
         day_volume = day_volume + (df[f"{PARCEL_TYPES[i]}_total"].values[:, None] * he).astype(int)
@@ -198,6 +208,7 @@ def add_hourly_volumes(df: pd.DataFrame, hour_evolution: list[np.ndarray]) -> pd
 
 
 def create_macro_stat_dataset(df: pd.DataFrame, origin: str) -> pd.DataFrame:
+    """Expand one-origin daily data into per-hour, per-destination training rows."""
     columns_stat_hour = ["hour", "min", "max", "mean", "std", "delta"]
     columns_day = ["center", "day", "season", "hist_avg_vol_tot", "hist_std_vol_tot"]
     columns_dest = ["n_exp_trucks", "frac_last_truck_needed", "hist_avg_vol", "hist_std_vol", "last_truck_needed"]
@@ -247,6 +258,7 @@ def generate_data_single_origin(
     margin: float = 0.2,
     shuffle: bool = False,
 ) -> pd.DataFrame:
+    """Generate full daily dataset for one origin across all seasons/day groups."""
     df_list = []
     for season_name, season_dict in data_dict.items():
         df_day_list = []
@@ -298,6 +310,7 @@ def generate_raw_data(
     n_weeks_high_season: int = 12,
     margin: float = 0.2,
 ) -> pd.DataFrame:
+    """Generate and merge raw data for all origins, then shuffle rows."""
     df_all_origins = []
     for origin in SORTING_CENTERS:
         df_origin = generate_data_single_origin(
@@ -320,6 +333,7 @@ def generate_raw_data(
 
 
 def create_macro_stat_dataset_all_origins(df: pd.DataFrame) -> pd.DataFrame:
+    """Build the per-destination macro-stat dataset for each origin and concatenate."""
     df_all_origins = []
     for origin in SORTING_CENTERS:
         df_origin = df[df["center"] == origin]

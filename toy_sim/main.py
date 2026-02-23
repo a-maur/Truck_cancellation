@@ -10,7 +10,12 @@ from core import N_HOURS, create_macro_stat_dataset_all_origins, generate_raw_da
 
 
 def build_raw_save_columns() -> list[str]:
-    save_columns = ["center", "day", "season"]
+    """Return the subset of raw columns persisted to disk.
+
+    The raw dataset has many intermediate columns. This list defines which
+    columns are exported for downstream training and inspection.
+    """
+    save_columns = ["center", "day", "season", 'hist_avg_vol_tot', 'hist_std_vol_tot']  # day features
     save_columns += [f"vol_h{hour}" for hour in range(N_HOURS)]
 
     destination_suffixes = [
@@ -18,6 +23,7 @@ def build_raw_save_columns() -> list[str]:
         "_frac_last_truck_needed",
         "_hist_avg_vol",
         "_hist_std_vol",
+        "_overflow",
         "_last_truck_needed",
     ]
 
@@ -31,6 +37,14 @@ def build_raw_save_columns() -> list[str]:
 
 
 def run(cfg: SimulationConfig | None = None, correlation_dest_list: Iterable[float] | None = None) -> None:
+    """Run the end-to-end data generation pipeline.
+
+    Steps:
+    1) Generate synthetic raw daily data.
+    2) Split into train/test.
+    3) Expand to per-destination hourly-stat samples.
+    4) Save output files.
+    """
     cfg = cfg or SimulationConfig()
     if correlation_dest_list is not None:
         cfg.correlation_dest_list = list(correlation_dest_list)
@@ -75,6 +89,11 @@ def run(cfg: SimulationConfig | None = None, correlation_dest_list: Iterable[flo
 
 
 def main(correlation_dest_list: Iterable[float] | None = None) -> None:
+    """CLI entrypoint.
+
+    - No argument: use correlation values from config.
+    - One float argument (e.g. `python main.py 0.9`): override with that value.
+    """
     if correlation_dest_list is None:
         parser = argparse.ArgumentParser(description="Run truck cancellation data simulation.")
         parser.add_argument(
