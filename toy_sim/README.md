@@ -60,7 +60,7 @@ data and historical patterns.
 
 ## Code output
 
-- `main.py` runs the simulation based on the configurables in `config.py` and produces two files that can be saved as pandas dataframe: `df_raw.pkl` and `df_per_dest_train(test).pkl`.
+- `main.py` runs the simulation based on the configurables in `config.py` and produces two files that can be saved as pandas dataframe: `df_raw.pkl` and `df_per_dest_train(test).pkl` (small example files con be found in `example/data/`).
 
 - `df_raw.pkl` corresponds to the generated day at the sorting centers, and contains all destinations and relevant features
   
