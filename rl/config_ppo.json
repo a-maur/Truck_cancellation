@@ -1,0 +1,78 @@
+{
+  "algorithm": "ppo",
+  "method": "ppo",
+  "output_root": "/disk/lhcb_data/maander/output_truck_cancellation",
+  "common_args": {
+    "seed": 42,
+    "updates": 300,
+    "rollout_size": 4096,
+    "ppo_epochs": 8,
+    "minibatch_size": 512,
+    "clip_ratio": 0.2,
+    "actor_lr": 0.0003,
+    "critic_lr": 0.001,
+    "entropy_coef": 0.01,
+    "value_coef": 1.0,
+    "grad_clip_norm": 0.5,
+    "hidden_sizes": [
+      128,
+      128
+    ],
+    "eval_every": 10,
+    "label_source": "fill_threshold",
+    "needed_fill_threshold": 0.2,
+    "truck_capacity": 100,
+    "reward_keep_needed": 1.0,
+    "reward_cancel_not_needed": 1.0,
+    "reward_cancel_needed": -5.0,
+    "reward_keep_not_needed": -1.0,
+    "early_cancel_bonus": 0.5,
+    "early_cancel_penalty": 0.5,
+    "decision_threshold": 0.5,
+    "stochastic_min_prob": 0.05,
+    "stochastic_max_prob": 0.95
+  },
+  "stages": {
+    "sweep_small": {
+      "args": {},
+      "grid": {
+        "actor_lr": [
+          0.0001,
+          0.0003,
+          0.001
+        ],
+        "critic_lr": [
+          0.0003,
+          0.001
+        ],
+        "clip_ratio": [
+          0.1,
+          0.2,
+          0.3
+        ],
+        "entropy_coef": [
+          0.0,
+          0.005,
+          0.01
+        ],
+        "hidden_sizes": [
+          [
+            128,
+            128
+          ],
+          [
+            256,
+            256
+          ]
+        ]
+      },
+      "tag_keys": [
+        "actor_lr",
+        "critic_lr",
+        "clip_ratio",
+        "entropy_coef",
+        "hidden_sizes"
+      ]
+    }
+  }
+}
