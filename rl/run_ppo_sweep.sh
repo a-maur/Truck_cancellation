@@ -3,7 +3,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default sweep settings. Edit here if needed.
-PYTHON_BIN="python3.11"
+PYTHON_BIN="python"
 CONFIG_PATH="${SCRIPT_DIR}/config_ppo.json"
 OUTPUT_ROOT="/disk/lhcb_data/maander/output_truck_cancellation"
 STAGE="sweep_small"

@@ -10,8 +10,10 @@ This module centralizes functionality reused by multiple optimisers:
 
 from __future__ import annotations
 
+import importlib
 import json
 import random
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -192,10 +194,34 @@ def _load_pickle_df(path: str | Path) -> pd.DataFrame:
     p = Path(path).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"Dataset not found: {p}")
-    df = pd.read_pickle(p)
+    try:
+        df = pd.read_pickle(p)
+    except ModuleNotFoundError as exc:
+        if "numpy._core" not in str(exc):
+            raise
+        _install_numpy_pickle_compat_aliases()
+        df = pd.read_pickle(p)
     if not isinstance(df, pd.DataFrame):
         raise TypeError(f"Loaded object from {p} is not a pandas DataFrame")
     return df
+
+
+def _install_numpy_pickle_compat_aliases() -> None:
+    """Alias NumPy 2.x pickle module paths when loading with NumPy 1.x."""
+    alias_map = {
+        "numpy._core": "numpy.core",
+        "numpy._core.numeric": "numpy.core.numeric",
+        "numpy._core.multiarray": "numpy.core.multiarray",
+        "numpy._core.umath": "numpy.core.umath",
+        "numpy._core._multiarray_umath": "numpy.core._multiarray_umath",
+    }
+    for alias_name, target_name in alias_map.items():
+        if alias_name in sys.modules:
+            continue
+        try:
+            sys.modules[alias_name] = importlib.import_module(target_name)
+        except Exception:
+            continue
 
 
 def _require_columns(df: pd.DataFrame, required: Iterable[str], name: str) -> None:

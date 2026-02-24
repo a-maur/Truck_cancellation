@@ -104,6 +104,55 @@ class PPOConfig:
     stochastic_min_prob: float = 0.05
     stochastic_max_prob: float = 0.95
 
+    # Optional convergence-based early stopping.
+    early_stop_enabled: bool = False
+    early_stop_warmup: int = 100
+    early_stop_window: int = 40
+    early_stop_check_every: int = 10
+    early_stop_patience: int = 3
+    early_stop_actor_slope_threshold: float = 1e-4
+    early_stop_critic_slope_threshold: float = 5e-4
+
+
+def _build_hour_axis(*hour_arrays: np.ndarray | None) -> np.ndarray:
+    mins: list[int] = []
+    maxs: list[int] = []
+    for arr in hour_arrays:
+        if arr is None:
+            continue
+        h = np.asarray(arr, dtype=np.float32).reshape(-1)
+        if h.size == 0:
+            continue
+        mins.append(int(np.floor(np.min(h))))
+        maxs.append(int(np.ceil(np.max(h))))
+    if not mins:
+        return np.arange(0, 1, dtype=np.int32)
+    return np.arange(min(mins), max(maxs) + 1, dtype=np.int32)
+
+
+def _hourly_count(hour_axis: np.ndarray, hours: np.ndarray | None) -> np.ndarray:
+    out = np.zeros((hour_axis.shape[0],), dtype=np.float32)
+    if hours is None:
+        return out
+    h = np.asarray(hours, dtype=np.int32).reshape(-1)
+    for i, hour in enumerate(hour_axis):
+        out[i] = float(np.sum(h == int(hour)))
+    return out
+
+
+def _linear_slope(values: np.ndarray) -> float:
+    """Return least-squares slope of y over index x=0..n-1."""
+    y = np.asarray(values, dtype=np.float32).reshape(-1)
+    if y.size < 2:
+        return 0.0
+    x = np.arange(y.size, dtype=np.float32)
+    x_centered = x - float(np.mean(x))
+    y_centered = y - float(np.mean(y))
+    denom = float(np.sum(x_centered * x_centered))
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.sum(x_centered * y_centered) / denom)
+
 
 class PPOTruckCancellationOptimiser:
     """Offline PPO trainer for the truck-cancellation policy."""
@@ -139,6 +188,22 @@ class PPOTruckCancellationOptimiser:
         )
 
         self.history: list[dict] = []
+        self.training_status: dict[str, object] = {
+            "requested_updates": int(self.cfg.updates),
+            "executed_updates": 0,
+            "stopped_early": False,
+            "stop_reason": "max_updates_reached",
+            "early_stop_enabled": bool(self.cfg.early_stop_enabled),
+            "early_stop_warmup": int(self.cfg.early_stop_warmup),
+            "early_stop_window": int(self.cfg.early_stop_window),
+            "early_stop_check_every": int(self.cfg.early_stop_check_every),
+            "early_stop_patience": int(self.cfg.early_stop_patience),
+            "early_stop_actor_slope_threshold": float(self.cfg.early_stop_actor_slope_threshold),
+            "early_stop_critic_slope_threshold": float(self.cfg.early_stop_critic_slope_threshold),
+            "last_actor_slope": None,
+            "last_critic_slope": None,
+            "plateau_counter": 0,
+        }
 
     def _ppo_update(self, rollout) -> tuple[float, float, float]:
         idx_all = np.arange(rollout.size, dtype=np.int32)
@@ -246,6 +311,481 @@ class PPOTruckCancellationOptimiser:
         metrics["avg_cancel_probability"] = float(np.mean(cancel_prob))
         return metrics
 
+    def _predict_split_details(
+        self,
+        split: str = "test",
+        mode: str = "deterministic",
+    ) -> dict[str, np.ndarray]:
+        split_norm = str(split).strip().lower()
+        if split_norm == "train":
+            x = self.data.x_train
+            y = self.data.y_train
+            h = self.data.train_hours
+        elif split_norm == "test":
+            x = self.data.x_test
+            y = self.data.y_test
+            h = self.data.test_hours
+        else:
+            raise ValueError("split must be train|test")
+
+        cancel_prob = predict_cancel_probability(self.policy, x)
+        actions = choose_actions(
+            cancel_prob=cancel_prob,
+            mode=mode,
+            threshold=float(self.cfg.decision_threshold),
+            rng=self.rng,
+            min_prob=float(self.cfg.stochastic_min_prob),
+            max_prob=float(self.cfg.stochastic_max_prob),
+        ).astype(np.int32)
+        needed = (np.asarray(y, dtype=np.float32) >= 0.5).astype(np.int32)
+        hours = np.asarray(h, dtype=np.int32) if h is not None else np.zeros((x.shape[0],), dtype=np.int32)
+        return {
+            "cancel_prob": np.asarray(cancel_prob, dtype=np.float32),
+            "actions": actions,
+            "needed": needed,
+            "hours": hours,
+        }
+
+    def _write_run_plots(
+        self,
+        out_dir: Path,
+        final_metrics: dict[str, dict[str, float]] | None = None,
+    ) -> list[str]:
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception:
+            return []
+
+        plot_dir = out_dir / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        generated: list[str] = []
+
+        def history_series(key: str) -> np.ndarray:
+            vals: list[float] = []
+            for row in self.history:
+                raw = row.get(key)
+                if raw is None:
+                    vals.append(np.nan)
+                else:
+                    try:
+                        vals.append(float(raw))
+                    except Exception:
+                        vals.append(np.nan)
+            return np.asarray(vals, dtype=np.float32)
+
+        def history_cancel_success_rate_series() -> np.ndarray:
+            vals: list[float] = []
+            for row in self.history:
+                succ_raw = row.get("test_cancel_success_count_det")
+                bad_raw = row.get("test_cancel_needed_count_det")
+                if succ_raw is None or bad_raw is None:
+                    vals.append(np.nan)
+                    continue
+                try:
+                    succ = float(succ_raw)
+                    bad = float(bad_raw)
+                except Exception:
+                    vals.append(np.nan)
+                    continue
+                denom = succ + bad
+                vals.append(float(succ / denom) if denom > 1e-12 else np.nan)
+            return np.asarray(vals, dtype=np.float32)
+
+        def finite_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            mask = np.isfinite(np.asarray(y, dtype=np.float32))
+            return np.asarray(x)[mask], np.asarray(y, dtype=np.float32)[mask]
+
+        try:
+            updates = np.asarray([int(row.get("update", 0)) for row in self.history], dtype=np.int32)
+            if updates.size > 0:
+                fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharex=True)
+                axes[0, 0].plot(updates, history_series("rollout_reward_mean"), linewidth=1.2)
+                axes[0, 0].set_title("Rollout Reward Mean")
+                axes[0, 0].set_ylabel("reward")
+                axes[0, 0].grid(alpha=0.2)
+
+                test_reward_series = history_series("test_reward_det")
+                u_reward, y_reward = finite_xy(updates, test_reward_series)
+                if y_reward.size > 0:
+                    axes[0, 1].plot(u_reward, y_reward, linewidth=1.2, color="tab:orange", marker="o", markersize=3)
+                axes[0, 1].set_title("Test Deterministic Reward")
+                axes[0, 1].set_ylabel("reward")
+                axes[0, 1].grid(alpha=0.2)
+
+                test_acc_series = history_series("test_acc_det")
+                u_acc, y_acc = finite_xy(updates, test_acc_series)
+                if y_acc.size > 0:
+                    axes[1, 0].plot(u_acc, y_acc, linewidth=1.2, color="tab:green", marker="o", markersize=3)
+                axes[1, 0].set_title("Test Deterministic Accuracy")
+                axes[1, 0].set_xlabel("update")
+                axes[1, 0].set_ylabel("accuracy")
+                axes[1, 0].set_ylim(-0.02, 1.02)
+                axes[1, 0].grid(alpha=0.2)
+
+                axes[1, 1].plot(updates, history_series("entropy"), linewidth=1.0, color="tab:purple")
+                axes[1, 1].set_title("Policy Entropy")
+                axes[1, 1].set_xlabel("update")
+                axes[1, 1].set_ylabel("entropy")
+                axes[1, 1].grid(alpha=0.2)
+
+                fig.tight_layout()
+                fig.savefig(plot_dir / "training_curves.png", dpi=140)
+                plt.close(fig)
+                generated.append("plots/training_curves.png")
+
+                actor_loss_series = history_series("actor_loss")
+                u_actor, y_actor = finite_xy(updates, actor_loss_series)
+                if y_actor.size > 0:
+                    fig, ax = plt.subplots(figsize=(9, 4))
+                    ax.plot(u_actor, y_actor, linewidth=1.2, color="tab:blue")
+                    ax.set_xlabel("update")
+                    ax.set_ylabel("actor_loss")
+                    ax.set_title("Actor Loss over Updates")
+                    ax.grid(alpha=0.2)
+                    fig.tight_layout()
+                    fig.savefig(plot_dir / "actor_loss_over_updates.png", dpi=140)
+                    plt.close(fig)
+                    generated.append("plots/actor_loss_over_updates.png")
+
+                critic_loss_series = history_series("critic_loss")
+                u_critic, y_critic = finite_xy(updates, critic_loss_series)
+                if y_critic.size > 0:
+                    fig, ax = plt.subplots(figsize=(9, 4))
+                    ax.plot(u_critic, y_critic, linewidth=1.2, color="tab:red")
+                    ax.set_xlabel("update")
+                    ax.set_ylabel("critic_loss")
+                    ax.set_title("Critic Loss over Updates")
+                    ax.grid(alpha=0.2)
+                    fig.tight_layout()
+                    fig.savefig(plot_dir / "critic_loss_over_updates.png", dpi=140)
+                    plt.close(fig)
+                    generated.append("plots/critic_loss_over_updates.png")
+
+                cancel_rate_hist = history_series("test_cancel_rate_det")
+                cancel_success_rate_hist = history_cancel_success_rate_series()
+                u_cancel_rate, y_cancel_rate = finite_xy(updates, cancel_rate_hist)
+                u_cancel_succ, y_cancel_succ = finite_xy(updates, cancel_success_rate_hist)
+                fig, ax = plt.subplots(figsize=(10, 4.5))
+                if y_cancel_rate.size > 0:
+                    ax.plot(
+                        u_cancel_rate,
+                        y_cancel_rate,
+                        linewidth=1.4,
+                        marker="o",
+                        markersize=2.5,
+                        label="cancel_rate_test",
+                    )
+                if y_cancel_succ.size > 0:
+                    ax.plot(
+                        u_cancel_succ,
+                        y_cancel_succ,
+                        linewidth=1.4,
+                        marker="o",
+                        markersize=2.5,
+                        label="cancel_success_rate_test",
+                        color="tab:green",
+                    )
+                ax.set_xlabel("update")
+                ax.set_ylabel("rate")
+                ax.set_ylim(-0.02, 1.02)
+                ax.set_title("Cancel Behavior over Training Updates (Deterministic Test)")
+                ax.grid(alpha=0.2)
+                handles, labels = ax.get_legend_handles_labels()
+                if handles:
+                    ax.legend(loc="lower right")
+
+                if final_metrics is not None:
+                    test_det = final_metrics.get("test_deterministic", {}) if isinstance(final_metrics, dict) else {}
+                    if isinstance(test_det, dict):
+                        test_cancel_rate = test_det.get("cancel_rate")
+                        test_cancel_success_rate = test_det.get("cancel_success_rate_among_cancellations")
+                        if test_cancel_rate is not None and test_cancel_success_rate is not None:
+                            try:
+                                txt = (
+                                    f"Final test cancel_rate = {float(test_cancel_rate):.3f}\n"
+                                    f"Final test cancel_success_rate = {float(test_cancel_success_rate):.3f}"
+                                )
+                                ax.text(
+                                    0.015,
+                                    0.98,
+                                    txt,
+                                    transform=ax.transAxes,
+                                    fontsize=9,
+                                    va="top",
+                                    ha="left",
+                                    bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+                                )
+                            except Exception:
+                                pass
+
+                fig.tight_layout()
+                fig.savefig(plot_dir / "cancel_behavior_over_updates.png", dpi=140)
+                plt.close(fig)
+                generated.append("plots/cancel_behavior_over_updates.png")
+        except Exception:
+            pass
+
+        try:
+            pred_test = self._predict_split_details(split="test", mode="deterministic")
+            test_hours = pred_test["hours"]
+            test_actions = pred_test["actions"]
+            test_needed = pred_test["needed"]
+
+            train_hours = (
+                np.asarray(self.data.train_hours, dtype=np.int32)
+                if self.data.train_hours is not None
+                else np.zeros((self.data.x_train.shape[0],), dtype=np.int32)
+            )
+            hour_axis = _build_hour_axis(train_hours, test_hours)
+            train_counts = _hourly_count(hour_axis, train_hours)
+            test_counts = _hourly_count(hour_axis, test_hours)
+            # Example day-route trajectory: cumulative volume + agent vs optimal decisions by hour.
+            test_df = self.data.test_df
+            example_plotted = False
+            if (
+                test_df is not None
+                and hasattr(test_df, "columns")
+                and all(col in test_df.columns for col in ("center", "dest", "hour"))
+                and test_actions.shape[0] == len(test_df)
+            ):
+                center_vals = np.asarray(test_df["center"].astype(str).to_numpy())
+                dest_vals = np.asarray(test_df["dest"].astype(str).to_numpy())
+                hour_vals = np.asarray(test_df["hour"].to_numpy(), dtype=np.int32)
+                uniq_hours = np.sort(np.unique(hour_vals))
+
+                route_pairs = sorted(set(zip(center_vals.tolist(), dest_vals.tolist())))
+                example_idx: np.ndarray | None = None
+                example_center = ""
+                example_dest = ""
+                example_slot = 0
+                example_slot_total = 0
+
+                for center_key, dest_key in route_pairs:
+                    route_mask = (center_vals == center_key) & (dest_vals == dest_key)
+                    idx_by_hour: list[np.ndarray] = []
+                    min_len: int | None = None
+                    for h in uniq_hours.tolist():
+                        idx_h = np.where(route_mask & (hour_vals == int(h)))[0]
+                        if idx_h.size == 0:
+                            idx_by_hour = []
+                            break
+                        idx_h = np.sort(idx_h)
+                        idx_by_hour.append(idx_h)
+                        min_len = int(idx_h.size) if min_len is None else min(int(min_len), int(idx_h.size))
+                    if not idx_by_hour or min_len is None or min_len <= 0:
+                        continue
+
+                    slot = int(min_len // 2)
+                    example_idx = np.asarray([arr[slot] for arr in idx_by_hour], dtype=np.int32)
+                    example_center = center_key
+                    example_dest = dest_key
+                    example_slot = slot
+                    example_slot_total = int(min_len)
+                    break
+
+                if example_idx is not None and example_idx.size > 1:
+                    ex_hours = hour_vals[example_idx]
+                    order = np.argsort(ex_hours)
+                    ex_idx = example_idx[order]
+                    ex_hours = ex_hours[order]
+
+                    if "max" in test_df.columns:
+                        ex_cum = np.asarray(test_df["max"].to_numpy(dtype=np.float32))[ex_idx]
+                        cum_label = "cumulative_volume (feature=max)"
+                    elif "mean" in test_df.columns:
+                        ex_cum = np.asarray(test_df["mean"].to_numpy(dtype=np.float32))[ex_idx]
+                        cum_label = "volume_proxy (feature=mean)"
+                    elif "delta" in test_df.columns:
+                        ex_delta = np.asarray(test_df["delta"].to_numpy(dtype=np.float32))[ex_idx]
+                        ex_cum = np.cumsum(ex_delta, dtype=np.float32)
+                        cum_label = "cumulative_volume_proxy (cumsum(delta))"
+                    else:
+                        ex_cum = np.asarray(ex_hours, dtype=np.float32)
+                        cum_label = "hour_index_proxy"
+
+                    ex_actions = test_actions[ex_idx].astype(np.int32)
+                    ex_needed = test_needed[ex_idx].astype(np.int32)
+                    ex_true_action = (ex_needed == 0).astype(np.int32)  # cancel when not needed, keep when needed
+                    ex_correct = ex_actions == ex_true_action
+
+                    fig, axes = plt.subplots(
+                        2,
+                        1,
+                        figsize=(10, 7),
+                        sharex=True,
+                        gridspec_kw={"height_ratios": [2.2, 1.0]},
+                    )
+
+                    axes[0].plot(ex_hours, ex_cum, linewidth=1.6, marker="o", color="tab:blue", label=cum_label)
+                    axes[0].set_ylabel("volume")
+                    axes[0].set_title(
+                        "Example Day Trajectory: "
+                        f"{example_center}->{example_dest} (sample {example_slot + 1}/{max(1, example_slot_total)})"
+                    )
+                    axes[0].grid(alpha=0.2)
+                    axes[0].legend(loc="upper left")
+
+                    axes[1].step(
+                        ex_hours,
+                        ex_true_action,
+                        where="mid",
+                        linewidth=1.4,
+                        linestyle="--",
+                        color="tab:gray",
+                        label="optimal_action",
+                    )
+                    axes[1].step(
+                        ex_hours,
+                        ex_actions,
+                        where="mid",
+                        linewidth=1.4,
+                        color="tab:blue",
+                        label="agent_action",
+                    )
+                    for h, a, ok in zip(ex_hours.tolist(), ex_actions.tolist(), ex_correct.tolist()):
+                        axes[1].scatter(
+                            [h],
+                            [a],
+                            s=45,
+                            c=("tab:green" if ok else "tab:red"),
+                            zorder=3,
+                        )
+
+                    axes[1].set_yticks([0, 1])
+                    axes[1].set_yticklabels(["keep", "cancel"])
+                    axes[1].set_xlabel("hour")
+                    axes[1].set_ylabel("decision")
+                    axes[1].set_ylim(-0.2, 1.2)
+                    axes[1].grid(alpha=0.2)
+                    axes[1].legend(loc="upper right")
+
+                    final_true = "cancel" if int(ex_true_action[-1]) == 1 else "keep"
+                    final_agent = "cancel" if int(ex_actions[-1]) == 1 else "keep"
+                    final_ok = bool(ex_correct[-1])
+                    axes[0].text(
+                        0.99,
+                        0.04,
+                        f"Final optimal: {final_true}\nFinal agent: {final_agent}\nFinal correct: {final_ok}",
+                        transform=axes[0].transAxes,
+                        ha="right",
+                        va="bottom",
+                        fontsize=9,
+                        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+                    )
+
+                    fig.tight_layout()
+                    fig.savefig(plot_dir / "hourly_volume_profile.png", dpi=140)
+                    plt.close(fig)
+                    generated.append("plots/hourly_volume_profile.png")
+                    example_plotted = True
+
+            if not example_plotted:
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.plot(hour_axis, test_counts, marker="o", linewidth=1.2, label="test_decision_points")
+                ax.plot(hour_axis, train_counts, marker="o", linewidth=1.2, label="train_decision_points")
+                ax.set_xlabel("hour")
+                ax.set_ylabel("count")
+                ax.set_title("Decision-Point Counts by Hour (fallback)")
+                ax.grid(alpha=0.2)
+                ax.legend(loc="best")
+                fig.tight_layout()
+                fig.savefig(plot_dir / "hourly_volume_profile.png", dpi=140)
+                plt.close(fig)
+                generated.append("plots/hourly_volume_profile.png")
+
+            test_hour_axis = np.sort(np.unique(np.asarray(test_hours, dtype=np.int32)))
+            cancel_rate_hour: list[float] = []
+            cancel_success_rate_hour: list[float] = []
+            for h in test_hour_axis.tolist():
+                mask_h = np.asarray(test_hours, dtype=np.int32) == int(h)
+                n_h = int(np.sum(mask_h))
+                if n_h <= 0:
+                    cancel_rate_hour.append(np.nan)
+                    cancel_success_rate_hour.append(np.nan)
+                    continue
+                actions_h = test_actions[mask_h]
+                needed_h = test_needed[mask_h]
+                cancel_count_h = int(np.sum(actions_h == 1))
+                success_count_h = int(np.sum((actions_h == 1) & (needed_h == 0)))
+                cancel_rate_hour.append(float(cancel_count_h / n_h))
+                cancel_success_rate_hour.append(float(success_count_h / cancel_count_h) if cancel_count_h > 0 else np.nan)
+
+            x = np.arange(test_hour_axis.shape[0], dtype=np.float32)
+            width = 0.38
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.bar(x - width / 2.0, cancel_rate_hour, width=width, label="cancel_rate", color="tab:blue")
+            ax.bar(
+                x + width / 2.0,
+                cancel_success_rate_hour,
+                width=width,
+                label="cancel_success_rate_among_cancellations",
+                color="tab:green",
+            )
+            ax.set_xticks(x)
+            ax.set_xticklabels([str(int(h)) for h in test_hour_axis.tolist()])
+            ax.set_xlabel("hour")
+            ax.set_ylabel("rate")
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_title("Test: Cancel Rate and Cancel Success Rate by Hour")
+            ax.grid(axis="y", alpha=0.2)
+            ax.legend(loc="upper right")
+            fig.tight_layout()
+            fig.savefig(plot_dir / "hourly_decision_rates_test.png", dpi=140)
+            plt.close(fig)
+            generated.append("plots/hourly_decision_rates_test.png")
+
+            test_df = self.data.test_df
+            if test_df is not None and hasattr(test_df, "columns") and "dest" in test_df.columns:
+                dest_values = np.asarray(test_df["dest"].astype(str).to_numpy()).reshape(-1)
+                if dest_values.shape[0] == test_actions.shape[0]:
+                    unique_dest = np.asarray(sorted(np.unique(dest_values)))
+                    cancel_rate_by_dest: list[float] = []
+                    cancel_success_rate_by_dest: list[float] = []
+                    for dest in unique_dest.tolist():
+                        mask = dest_values == dest
+                        n_rows = int(np.sum(mask))
+                        if n_rows <= 0:
+                            cancel_rate_by_dest.append(np.nan)
+                            cancel_success_rate_by_dest.append(np.nan)
+                            continue
+                        actions_d = test_actions[mask]
+                        needed_d = test_needed[mask]
+                        cancel_count = int(np.sum(actions_d == 1))
+                        success_count = int(np.sum((actions_d == 1) & (needed_d == 0)))
+                        cancel_rate_by_dest.append(float(cancel_count / n_rows))
+                        cancel_success_rate_by_dest.append(float(success_count / cancel_count) if cancel_count > 0 else 0.0)
+
+                    x = np.arange(unique_dest.shape[0], dtype=np.float32)
+                    width = 0.4
+                    fig, ax = plt.subplots(figsize=(11, 4.8))
+                    ax.bar(x - width / 2.0, cancel_rate_by_dest, width=width, label="cancel_rate", color="tab:blue")
+                    ax.bar(
+                        x + width / 2.0,
+                        cancel_success_rate_by_dest,
+                        width=width,
+                        label="cancel_success_rate",
+                        color="tab:green",
+                    )
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(unique_dest.tolist())
+                    ax.set_xlabel("destination")
+                    ax.set_ylabel("rate")
+                    ax.set_ylim(-0.02, 1.02)
+                    ax.set_title("Test Cancel Metrics by Destination (Deterministic)")
+                    ax.grid(axis="y", alpha=0.2)
+                    ax.legend(loc="upper right")
+                    fig.tight_layout()
+                    fig.savefig(plot_dir / "cancel_metrics_by_destination_test.png", dpi=140)
+                    plt.close(fig)
+                    generated.append("plots/cancel_metrics_by_destination_test.png")
+        except Exception:
+            pass
+
+        return generated
+
     def train(self) -> dict[str, dict[str, float]]:
         print(
             f"[PPO] Start training: state_dim={self.data.state_dim}, "
@@ -253,6 +793,20 @@ class PPOTruckCancellationOptimiser:
         )
 
         t0 = time.perf_counter()
+        actor_loss_trace: list[float] = []
+        critic_loss_trace: list[float] = []
+        plateau_counter = 0
+        stop_reason = "max_updates_reached"
+        stopped_early = False
+        executed_updates = 0
+
+        warmup = max(1, int(self.cfg.early_stop_warmup))
+        window = max(5, int(self.cfg.early_stop_window))
+        check_every = max(1, int(self.cfg.early_stop_check_every))
+        patience = max(1, int(self.cfg.early_stop_patience))
+        actor_thr = float(self.cfg.early_stop_actor_slope_threshold)
+        critic_thr = float(self.cfg.early_stop_critic_slope_threshold)
+
         for update in range(1, self.cfg.updates + 1):
             rollout = self.env.collect_rollout(
                 policy=self.policy,
@@ -260,6 +814,8 @@ class PPOTruckCancellationOptimiser:
                 batch_size=self.cfg.rollout_size,
             )
             actor_loss, critic_loss, entropy = self._ppo_update(rollout)
+            actor_loss_trace.append(float(actor_loss))
+            critic_loss_trace.append(float(critic_loss))
             rollout_reward_mean = float(np.mean(rollout.rewards))
 
             row = {
@@ -296,9 +852,41 @@ class PPOTruckCancellationOptimiser:
                     f"test_bad_cancel={test_det['cancel_needed_count']:.0f}"
                 )
             self.history.append(row)
+            executed_updates = update
+
+            if bool(self.cfg.early_stop_enabled) and update >= warmup and update % check_every == 0:
+                if len(actor_loss_trace) >= window and len(critic_loss_trace) >= window:
+                    actor_slope = _linear_slope(np.asarray(actor_loss_trace[-window:], dtype=np.float32))
+                    critic_slope = _linear_slope(np.asarray(critic_loss_trace[-window:], dtype=np.float32))
+                    actor_flat = abs(actor_slope) <= actor_thr
+                    critic_flat = abs(critic_slope) <= critic_thr
+                    plateau_counter = (plateau_counter + 1) if (actor_flat and critic_flat) else 0
+                    self.training_status["last_actor_slope"] = float(actor_slope)
+                    self.training_status["last_critic_slope"] = float(critic_slope)
+                    self.training_status["plateau_counter"] = int(plateau_counter)
+                    print(
+                        f"[PPO] convergence_check update={update}/{self.cfg.updates} "
+                        f"actor_slope={actor_slope:+.6f} critic_slope={critic_slope:+.6f} "
+                        f"plateau={plateau_counter}/{patience}"
+                    )
+                    if plateau_counter >= patience:
+                        stopped_early = True
+                        stop_reason = (
+                            f"converged_loss_slopes(window={window},actor_thr={actor_thr},critic_thr={critic_thr})"
+                        )
+                        print(f"[PPO] Early stop triggered at update={update}: {stop_reason}")
+                        break
 
         elapsed = time.perf_counter() - t0
         print(f"[PPO] Training done in {elapsed:.2f}s")
+        self.training_status["executed_updates"] = int(executed_updates)
+        self.training_status["stopped_early"] = bool(stopped_early)
+        self.training_status["stop_reason"] = str(stop_reason)
+        self.training_status["elapsed_s"] = float(elapsed)
+        print(
+            f"[PPO] Completion status: executed_updates={executed_updates}/{self.cfg.updates} "
+            f"stopped_early={stopped_early} reason={stop_reason}"
+        )
 
         final_metrics = {
             "train_deterministic": self.evaluate_split(split="train", mode="deterministic"),
@@ -330,6 +918,15 @@ class PPOTruckCancellationOptimiser:
         )
         save_json(out / "final_metrics.json", final_metrics)
         save_json(out / "history.json", self.history)
+        save_json(out / "training_status.json", self.training_status)
+        generated_plots = self._write_run_plots(out, final_metrics=final_metrics)
+        save_json(
+            out / "plots_manifest.json",
+            {
+                "generated": generated_plots,
+                "count": int(len(generated_plots)),
+            },
+        )
         return out
 
 
@@ -412,6 +1009,23 @@ def build_arg_parser(
     p.add_argument("--hidden-sizes", type=str, default="128,128")
     p.add_argument("--no-adv-normalize", action="store_true")
     p.add_argument("--eval-every", type=int, default=10)
+    p.add_argument("--early-stop-enabled", action="store_true", help="Enable convergence-based early stopping")
+    p.add_argument("--early-stop-warmup", type=int, default=100, help="Min updates before early-stop checks")
+    p.add_argument("--early-stop-window", type=int, default=40, help="Rolling window size used for loss slopes")
+    p.add_argument("--early-stop-check-every", type=int, default=10, help="Check convergence every N updates")
+    p.add_argument("--early-stop-patience", type=int, default=3, help="Consecutive flat-slope checks before stop")
+    p.add_argument(
+        "--early-stop-actor-slope-threshold",
+        type=float,
+        default=1e-4,
+        help="Absolute actor-loss slope threshold for convergence",
+    )
+    p.add_argument(
+        "--early-stop-critic-slope-threshold",
+        type=float,
+        default=5e-4,
+        help="Absolute critic-loss slope threshold for convergence",
+    )
 
     p.add_argument("--decision-threshold", type=float, default=0.5)
     p.add_argument("--stochastic-min-prob", type=float, default=0.05)
@@ -528,6 +1142,13 @@ def main() -> None:
         decision_threshold=float(args.decision_threshold),
         stochastic_min_prob=float(args.stochastic_min_prob),
         stochastic_max_prob=float(args.stochastic_max_prob),
+        early_stop_enabled=bool(args.early_stop_enabled),
+        early_stop_warmup=int(args.early_stop_warmup),
+        early_stop_window=int(args.early_stop_window),
+        early_stop_check_every=int(args.early_stop_check_every),
+        early_stop_patience=int(args.early_stop_patience),
+        early_stop_actor_slope_threshold=float(args.early_stop_actor_slope_threshold),
+        early_stop_critic_slope_threshold=float(args.early_stop_critic_slope_threshold),
     )
 
     trainer = PPOTruckCancellationOptimiser(data=data, reward_config=reward_cfg, cfg=ppo_cfg)
@@ -552,6 +1173,8 @@ def main() -> None:
             f"cancel_needed={val['cancel_needed_count']:.0f}"
         )
     print(f"[PPO] Artifacts saved to: {saved_dir}")
+    print(f"[PPO] Training status: {saved_dir / 'training_status.json'}")
+    print(f"[PPO] Plot manifest: {saved_dir / 'plots_manifest.json'}")
 
 
 if __name__ == "__main__":

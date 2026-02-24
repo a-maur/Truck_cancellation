@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import shutil
 import shlex
@@ -322,6 +323,135 @@ def _make_overview_plots(
         plt.close(fig)
 
 
+def _run_trial_command(
+    cmd: list[str],
+    log_path: Path,
+    stream_trial_logs: bool,
+) -> int:
+    """Run one trial command, persist logs, and optionally stream live output."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    if not stream_trial_logs:
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        with log_path.open("w", encoding="utf-8") as f:
+            f.write(proc.stdout or "")
+            if proc.stderr:
+                f.write("\n[stderr]\n")
+                f.write(proc.stderr)
+        return int(proc.returncode)
+
+    with log_path.open("w", encoding="utf-8") as f:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                f.write(line)
+                print(line, end="")
+        return int(proc.wait())
+
+
+def _copy_trial_plots_into_summary(
+    summary_dir: Path,
+    rows: list[dict[str, Any]],
+    best_trial_index: int | None,
+) -> dict[str, Any]:
+    """Copy per-trial run plots into summary folders instead of regenerating them."""
+    trial_plots_root = summary_dir / "trial_plots"
+    summary_plot_root = summary_dir / "plots"
+    trial_plots_root.mkdir(parents=True, exist_ok=True)
+    summary_plot_root.mkdir(parents=True, exist_ok=True)
+
+    copied_trials = 0
+    copied_files = 0
+    missing_plot_dirs: list[str] = []
+    copied_by_trial: list[dict[str, Any]] = []
+
+    for row in rows:
+        run_dir_raw = row.get("run_dir")
+        if not run_dir_raw:
+            continue
+        trial_idx = int(row.get("trial_index", -1))
+        tag = str(row.get("tag", "default"))
+        trial_key = f"trial_{trial_idx:03d}_{tag}"
+        src_plot_dir = Path(str(run_dir_raw)).expanduser() / "plots"
+        src_manifest = Path(str(run_dir_raw)).expanduser() / "plots_manifest.json"
+        dst_plot_dir = trial_plots_root / trial_key
+
+        copied_names: list[str] = []
+        if src_plot_dir.exists():
+            dst_plot_dir.mkdir(parents=True, exist_ok=True)
+            for src in sorted(src_plot_dir.glob("*.png")):
+                dst = dst_plot_dir / src.name
+                try:
+                    shutil.copy2(src, dst)
+                    copied_names.append(src.name)
+                except Exception:
+                    continue
+        else:
+            missing_plot_dirs.append(str(src_plot_dir))
+
+        if src_manifest.exists():
+            dst_plot_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(src_manifest, dst_plot_dir / "plots_manifest.json")
+            except Exception:
+                pass
+
+        if copied_names:
+            copied_trials += 1
+            copied_files += len(copied_names)
+            copied_by_trial.append(
+                {
+                    "trial_index": trial_idx,
+                    "tag": tag,
+                    "n_files": len(copied_names),
+                    "files": copied_names,
+                    "dest_dir": str(dst_plot_dir),
+                }
+            )
+
+    best_trial_plot_files: list[str] = []
+    if best_trial_index is not None:
+        best_row = next(
+            (
+                r
+                for r in rows
+                if int(r.get("trial_index", -1)) == int(best_trial_index)
+                and r.get("run_dir") is not None
+            ),
+            None,
+        )
+        if best_row is not None:
+            best_run_dir = Path(str(best_row["run_dir"])).expanduser()
+            best_plot_dir = best_run_dir / "plots"
+            if best_plot_dir.exists():
+                for src in sorted(best_plot_dir.glob("*.png")):
+                    dst_name = f"best_trial_{int(best_trial_index):03d}_{src.name}"
+                    dst = summary_plot_root / dst_name
+                    try:
+                        shutil.copy2(src, dst)
+                        best_trial_plot_files.append(str(dst))
+                    except Exception:
+                        continue
+
+    return {
+        "trial_plots_root": str(trial_plots_root),
+        "copied_trials": int(copied_trials),
+        "copied_files": int(copied_files),
+        "missing_plot_dirs": sorted(set(missing_plot_dirs)),
+        "copied_by_trial": copied_by_trial,
+        "best_trial_plot_files": best_trial_plot_files,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run PPO sweep trials and summarize results.")
     parser.add_argument("--config", type=str, default=str(default_config_path()), help="Path to config_ppo.json")
@@ -349,6 +479,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shuffle-trials", action="store_true", help="Shuffle trial order")
     parser.add_argument("--shuffle-seed", type=int, default=42, help="Seed used when shuffling")
     parser.add_argument("--skip-existing", action="store_true", help="Skip trials with existing final_metrics.json")
+    parser.add_argument(
+        "--stream-trial-logs",
+        action="store_true",
+        help="Stream optimiser logs to console while also writing per-trial log files",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands only, do not execute")
     parser.add_argument(
         "--objective-key",
@@ -482,18 +617,16 @@ def main() -> None:
 
         run_dir.mkdir(parents=True, exist_ok=True)
         t_start = time.time()
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        return_code = _run_trial_command(
+            cmd=cmd,
+            log_path=log_path,
+            stream_trial_logs=bool(args.stream_trial_logs),
+        )
         runtime_s = time.time() - t_start
 
-        with log_path.open("w", encoding="utf-8") as f:
-            f.write(proc.stdout or "")
-            if proc.stderr:
-                f.write("\n[stderr]\n")
-                f.write(proc.stderr)
-
         record["runtime_s"] = runtime_s
-        record["return_code"] = int(proc.returncode)
-        record["status"] = "ok" if proc.returncode == 0 else "failed"
+        record["return_code"] = int(return_code)
+        record["status"] = "ok" if return_code == 0 else "failed"
 
         metrics = _load_json(metrics_path)
         if metrics is not None:
@@ -547,6 +680,12 @@ def main() -> None:
     )
     latex_pdf = _compile_hparam_latex_pdf(summary_dir=summary_dir, table_filename="hyperparams_table.tex")
     summary["latex_pdf"] = latex_pdf
+    copied_trial_plots = _copy_trial_plots_into_summary(
+        summary_dir=summary_dir,
+        rows=rows,
+        best_trial_index=best_trial_index,
+    )
+    summary["copied_trial_plots"] = copied_trial_plots
     _write_json(summary_dir / "summary.json", summary)
     _make_overview_plots(summary_dir=summary_dir, rows=rows, objective_mode=args.objective_mode)
 
@@ -562,6 +701,12 @@ def main() -> None:
             "[SWEEP] Failed to compile LaTeX PDF; "
             f"see {summary_dir / 'hyperparams_table_pdflatex.log'}"
         )
+    print(
+        "[SWEEP] Copied trial plots: "
+        f"n_trials={copied_trial_plots.get('copied_trials', 0)} "
+        f"n_files={copied_trial_plots.get('copied_files', 0)} "
+        f"into {summary_dir / 'trial_plots'}"
+    )
     print(f"[SWEEP] Wrote plots in: {summary_dir / 'plots'}")
     if valid_rows_sorted:
         best = valid_rows_sorted[0]

@@ -47,10 +47,23 @@ bash run_ppo.sh
 The wrapper already contains defaults for:
 
 ```bash
-PYTHON_BIN, CONFIG_PATH, OUTPUT_ROOT, STAGE, TRIAL_INDEX, RUN_NAME
+PYTHON_BIN, CONFIG_PATH, OUTPUT_ROOT, STAGE, TRIAL_INDEX, RUN_NAME, WITH_SUMMARY, SKIP_EXISTING, STREAM_TRIAL_LOGS
 ```
 
+By default `PYTHON_BIN=python`, so it uses your active conda environment.
+
 Edit these at the top of `run_ppo.sh` if needed.
+
+`run_ppo.sh` defaults to `WITH_SUMMARY=1`, which routes the run through `run_ppo_sweep.py` with `--max-trials 1` (and `--start-index` from `TRIAL_INDEX`). This means you get a `summary/` folder even when running a single trial. Set `WITH_SUMMARY=0` to run `optimiser_ppo.py` directly.
+
+`run_ppo.sh` also defaults to `STREAM_TRIAL_LOGS=1`, so optimiser progress lines (for example `update=10/300`) are printed live even in summary/sweep mode.
+
+You can override wrapper defaults at launch without editing the script. Example direct single trial (no sweep wrapper):
+
+```bash
+cd Truck_cancellation/rl
+WITH_SUMMARY=0 bash run_ppo.sh
+```
 
 Useful options:
 
@@ -66,14 +79,41 @@ python3.11 Truck_cancellation/rl/optimiser_ppo.py \
   --early-cancel-penalty 0.7
 ```
 
+Optional convergence stop (based on actor/critic loss slope):
+
+```bash
+python3.11 Truck_cancellation/rl/optimiser_ppo.py \
+  --early-stop-enabled \
+  --early-stop-warmup 100 \
+  --early-stop-window 40 \
+  --early-stop-check-every 10 \
+  --early-stop-patience 3 \
+  --early-stop-actor-slope-threshold 1e-4 \
+  --early-stop-critic-slope-threshold 5e-4
+```
+
+By default, early stopping is disabled. In that default mode, `training_status.json` should report `executed_updates == requested_updates`.
+
 Outputs are saved under `/disk/lhcb_data/maander/output_truck_cancellation/ppo_<timestamp>/` by default (or `--output-dir` if provided), including:
 
 - `policy.weights.h5`
 - `value.weights.h5`
 - `final_metrics.json`
 - `history.json`
+- `training_status.json` (requested vs executed updates, stop reason, last loss slopes)
 - `run_config.json`
 - `dataset_metadata.json`
+- `plots_manifest.json`
+- `plots/` (when `matplotlib` is available):
+  - `training_curves.png` (reward/accuracy/entropy over updates)
+  - `actor_loss_over_updates.png`
+  - `critic_loss_over_updates.png`
+  - `cancel_behavior_over_updates.png` (cancel rate + cancel success rate over updates, with final test values)
+  - `hourly_volume_profile.png` (example route-day cumulative volume + agent decisions by hour + final optimal decision)
+  - `hourly_decision_rates_test.png` (test cancel rate and cancel success rate by hour)
+  - `cancel_metrics_by_destination_test.png`
+
+When `WITH_SUMMARY=1` in `run_ppo.sh`, outputs follow the sweep layout under `/disk/lhcb_data/maander/output_truck_cancellation/<run-name>/` with `trials/`, `logs/`, and `summary/`.
 
 To save in your shared output location with a named folder:
 
@@ -120,9 +160,14 @@ bash run_ppo_sweep.sh
 
 - `PYTHON_BIN, CONFIG_PATH, OUTPUT_ROOT, STAGE, RUN_NAME, SKIP_EXISTING`
 
+To stream optimiser logs during sweep execution, add:
+
+- `--stream-trial-logs`
+
 The sweep runner writes the following structure under `/disk/lhcb_data/maander/output_truck_cancellation/<run-name>/`:
 
 - `trials/`: trial folders (`trial_XXX_*`) with each trial's PPO artifacts
+  - each trial folder also contains `plots/` + `plots_manifest.json` from `optimiser_ppo.py`
 - `logs/`: one log file per trial
 - `summary/`:
   - `summary.json`
@@ -130,8 +175,10 @@ The sweep runner writes the following structure under `/disk/lhcb_data/maander/o
   - `hyperparams_table.tex` (fixed + swept ranges + best values)
   - `hyperparams_table.pdf` (auto-generated when `pdflatex` is installed)
   - `hyperparams_table_pdflatex.log` (compile log when PDF generation is attempted)
+  - `trial_plots/`: copied per-trial plot folders (`trial_XXX_*/`)
   - `plots/objective_by_trial.png`
   - `plots/metrics_by_trial.png`
+  - `plots/best_trial_XXX_*.png` (copied best-trial generation plots)
 
 Ranking defaults to maximizing:
 
