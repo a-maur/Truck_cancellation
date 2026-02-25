@@ -80,6 +80,10 @@ except ImportError:
     )
 
 
+def default_output_root_path() -> Path:
+    return Path(__file__).resolve().parent / "outputs"
+
+
 @dataclass
 class PPOConfig:
     """Hyperparameters for one-step PPO training."""
@@ -88,7 +92,7 @@ class PPOConfig:
     updates: int = 300
     rollout_size: int = 4096
     ppo_epochs: int = 8
-    minibatch_size: int = 512
+    minibatch_size: int = 1
     clip_ratio: float = 0.2
     actor_lr: float = 3e-4
     critic_lr: float = 1e-3
@@ -972,7 +976,7 @@ def build_arg_parser(
     p.add_argument(
         "--output-root",
         type=str,
-        default="/disk/lhcb_data/maander/output_truck_cancellation",
+        default=str(default_output_root_path()),
         help="Root output directory used when --output-dir is not provided",
     )
     p.add_argument(
@@ -989,8 +993,8 @@ def build_arg_parser(
     p.add_argument(
         "--label-source",
         type=str,
-        default="fill_threshold",
-        help="How to derive needed-truck label: fill_threshold|dataset_label",
+        default="dataset_label",
+        help="How to derive needed-truck label: dataset_label|fill_threshold",
     )
     p.add_argument("--needed-fill-threshold", type=float, default=0.2, help="Needed if last truck fill >= threshold")
     p.add_argument("--truck-capacity", type=int, default=100, help="Parcels per truck for fill-ratio criterion")
@@ -999,7 +1003,7 @@ def build_arg_parser(
     p.add_argument("--updates", type=int, default=300)
     p.add_argument("--rollout-size", type=int, default=4096)
     p.add_argument("--ppo-epochs", type=int, default=8)
-    p.add_argument("--minibatch-size", type=int, default=512)
+    p.add_argument("--minibatch-size", type=int, default=1)
     p.add_argument("--clip-ratio", type=float, default=0.2)
     p.add_argument("--actor-lr", type=float, default=3e-4)
     p.add_argument("--critic-lr", type=float, default=1e-3)

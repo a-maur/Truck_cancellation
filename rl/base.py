@@ -57,7 +57,7 @@ class FeatureConfig:
 class LabelConfig:
     """How to derive the "truck needed" target used for rewards/training."""
 
-    source: str = "fill_threshold"
+    source: str = "dataset_label"
     needed_fill_threshold: float = 0.2
     n_parcels_per_truck: int = 100
 

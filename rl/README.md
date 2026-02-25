@@ -6,7 +6,7 @@ This folder contains RL training code for the truck-cancellation problem in `Tru
 
 - `base.py`: shared utilities used by optimisers
   - data loading and feature construction
-  - label derivation (`fill_threshold` criterion supported)
+  - label derivation (defaults to dataset `last_truck_needed`; `fill_threshold` also supported)
   - reward shaping (including early-cancel weighting by timestep)
   - metrics (`cancel_success_count`, `cancel_needed_count`, `cancel_rate`, etc.)
   - shared model and replay components
@@ -22,8 +22,8 @@ This folder contains RL training code for the truck-cancellation problem in `Tru
   - `0` = keep last truck
   - `1` = cancel last truck
 - Label (`truck needed`) can be derived by:
-  - dataset label (`last_truck_needed`) or
-  - fill threshold criterion (`needed if estimated last-truck fill >= threshold`, default `0.2`)
+  - dataset label (`last_truck_needed`, default) or
+  - fill threshold criterion (`needed if estimated last-truck fill >= threshold`)
 - Reward is asymmetric and can include **time weighting**:
   - successful early cancellation gets larger bonus
   - wrong early cancellation gets larger penalty
@@ -73,8 +73,7 @@ python3.11 Truck_cancellation/rl/optimiser_ppo.py \
   --stage sweep_small \
   --trial-index 0 \
   --updates 500 \
-  --label-source fill_threshold \
-  --needed-fill-threshold 0.2 \
+  --label-source dataset_label \
   --early-cancel-bonus 0.7 \
   --early-cancel-penalty 0.7
 ```
@@ -192,6 +191,28 @@ and can be changed with:
 If a stage has no grid, the LaTeX table includes fixed hyperparameters only.
 
 If `pdflatex` is not available in your environment, the sweep still writes `hyperparams_table.tex` and skips PDF generation.
+
+## Correlation vs Hourly Cancel Plot
+
+To train one PPO model per destination-correlation value and plot hourly fraction of correctly cancelled trucks by route:
+
+```bash
+python3.11 Truck_cancellation/rl/run_corr_hourly_cancel_plot.py \
+  --all-centers-grid \
+  --correlations 0.9
+```
+
+Outputs are written under `rl/outputs/corr_hourly_<timestamp>/`:
+
+- `datasets/corr_*/`: generated toy_sim pickles per correlation
+- `runs/corr_*/`: per-correlation PPO artifacts + `hourly_metrics.csv`
+- `plots/all_centers_hourly_correctly_cancelled_by_corr.pdf` (with `--all-centers-grid`)
+- `all_hourly_metrics.csv`
+- `summary_by_correlation.csv`
+
+In this plot script, `fraction_correctly_cancelled` is:
+
+- `correct_cancels / cancellations` (per center, destination, hour)
 
 ## Notes
 

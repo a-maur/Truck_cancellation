@@ -460,7 +460,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-root",
         type=str,
         default=None,
-        help="Root directory for sweep outputs (default: config.output_root or rl/runs_sweeps)",
+        help="Root directory for sweep outputs (default: config.output_root or rl/outputs)",
     )
     parser.add_argument(
         "--run-name",
@@ -530,15 +530,16 @@ def main() -> None:
         indices = indices[: max(0, int(args.max_trials))]
 
     script_path = Path(__file__).resolve().with_name("optimiser_ppo.py")
-    base_output_root = (
-        Path(args.output_root).expanduser().resolve()
-        if args.output_root is not None
-        else (
-            Path(cfg.get("output_root")).expanduser().resolve()
-            if cfg.get("output_root")
-            else (Path(__file__).resolve().parent / "runs_sweeps")
-        )
-    )
+    cfg_output_root = cfg.get("output_root")
+    if args.output_root is not None:
+        base_output_root = Path(args.output_root).expanduser().resolve()
+    elif cfg_output_root:
+        cfg_root = Path(str(cfg_output_root)).expanduser()
+        if not cfg_root.is_absolute():
+            cfg_root = config_path.parent / cfg_root
+        base_output_root = cfg_root.resolve()
+    else:
+        base_output_root = (Path(__file__).resolve().parent / "outputs").resolve()
     output_root = base_output_root / (str(args.run_name) if args.run_name else stage_name)
     trials_root = output_root / "trials"
     logs_root = output_root / "logs"

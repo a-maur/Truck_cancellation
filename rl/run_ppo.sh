@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Default run settings. Edit here if you want a different baseline run.
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CONFIG_PATH="${CONFIG_PATH:-${SCRIPT_DIR}/config_ppo.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/disk/lhcb_data/maander/output_truck_cancellation}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs}"
 STAGE="${STAGE:-sweep_small}"
 TRIAL_INDEX="${TRIAL_INDEX:-0}"
 RUN_NAME="${RUN_NAME:-piperun_3}"

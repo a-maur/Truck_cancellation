@@ -1,13 +1,13 @@
 {
   "algorithm": "ppo",
   "method": "ppo",
-  "output_root": "/disk/lhcb_data/maander/output_truck_cancellation",
+  "output_root": "outputs",
   "common_args": {
     "seed": 42,
     "updates": 300,
     "rollout_size": 4096,
     "ppo_epochs": 8,
-    "minibatch_size": 512,
+    "minibatch_size": 1,
     "clip_ratio": 0.2,
     "actor_lr": 0.0003,
     "critic_lr": 0.001,
@@ -19,7 +19,7 @@
       128
     ],
     "eval_every": 10,
-    "label_source": "fill_threshold",
+    "label_source": "dataset_label",
     "needed_fill_threshold": 0.2,
     "truck_capacity": 100,
     "reward_keep_needed": 1.0,

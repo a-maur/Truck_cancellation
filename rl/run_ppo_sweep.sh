@@ -3,12 +3,12 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default sweep settings. Edit here if needed.
-PYTHON_BIN="python"
-CONFIG_PATH="${SCRIPT_DIR}/config_ppo.json"
-OUTPUT_ROOT="/disk/lhcb_data/maander/output_truck_cancellation"
-STAGE="sweep_small"
-RUN_NAME="piperun_1_sweep"
-SKIP_EXISTING="1"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+CONFIG_PATH="${CONFIG_PATH:-${SCRIPT_DIR}/config_ppo.json}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs}"
+STAGE="${STAGE:-sweep_small}"
+RUN_NAME="${RUN_NAME:-piperun_1_sweep}"
+SKIP_EXISTING="${SKIP_EXISTING:-1}"
 
 cmd=(
   "${PYTHON_BIN}"
