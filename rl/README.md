@@ -199,16 +199,24 @@ To train one PPO model per destination-correlation value and plot hourly fractio
 ```bash
 python3.11 Truck_cancellation/rl/run_corr_hourly_cancel_plot.py \
   --all-centers-grid \
-  --correlations 0.9
+  --correlations 0.9 \
+  --run-name initial_tests
 ```
 
-Outputs are written under `rl/outputs/corr_hourly_<timestamp>/`:
+Outputs are written under `rl/outputs/<run-name>/` (for example `rl/outputs/initial_tests/`):
 
-- `datasets/corr_*/`: generated toy_sim pickles per correlation
-- `runs/corr_*/`: per-correlation PPO artifacts + `hourly_metrics.csv`
-- `plots/all_centers_hourly_correctly_cancelled_by_corr.pdf` (with `--all-centers-grid`)
-- `all_hourly_metrics.csv`
-- `summary_by_correlation.csv`
+- `trial_1/`, `trial_2/`, ...:
+  - per-trial PPO artifacts (`policy.weights.h5`, `value.weights.h5`, `final_metrics.json`, plots, etc.)
+  - generated data under `trial_N/data/`
+  - `trial_N/hourly_metrics.csv`
+- `summary/`:
+  - `summary/all_hourly_metrics.csv`
+  - `summary/summary_by_trial.csv`
+  - `summary/all_centers_hourly_correctly_cancelled_by_corr.pdf` (with `--all-centers-grid`)
+- `best_weights/`:
+  - copied best-trial `policy.weights.h5` and `value.weights.h5`
+  - `best_trial.json` with selection metadata
+- `info/run_info.json`: run-level configuration and context
 
 In this plot script, `fraction_correctly_cancelled` is:
 

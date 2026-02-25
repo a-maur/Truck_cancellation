@@ -1,9 +1,12 @@
-WITH_SUMMARY=0 bash run_ppo.sh \
-  --early-stop-enabled \
-  --early-stop-warmup 100 \
-  --early-stop-window 40 \
-  --early-stop-check-every 10 \
-  --early-stop-patience 3 \
-  --early-stop-actor-slope-threshold 1e-4 \
-  --early-stop-critic-slope-threshold 5e-4
+#!/usr/bin/env bash
+set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cmd=(bash "${SCRIPT_DIR}/run_ppo.sh")
+if [[ "$#" -gt 0 ]]; then
+  cmd+=("$@")
+fi
+
+echo "[run] ${cmd[*]}"
+exec "${cmd[@]}"

@@ -158,6 +158,12 @@ def _linear_slope(values: np.ndarray) -> float:
     return float(np.sum(x_centered * y_centered) / denom)
 
 
+def _format_minutes_seconds(seconds: float) -> str:
+    total_seconds = max(0, int(round(float(seconds))))
+    minutes, rem = divmod(total_seconds, 60)
+    return f"{minutes}m {rem:02d}s"
+
+
 class PPOTruckCancellationOptimiser:
     """Offline PPO trainer for the truck-cancellation policy."""
 
@@ -209,7 +215,12 @@ class PPOTruckCancellationOptimiser:
             "plateau_counter": 0,
         }
 
-    def _ppo_update(self, rollout) -> tuple[float, float, float]:
+    def _ppo_update(
+        self,
+        rollout,
+        update_idx: int | None = None,
+        total_updates: int | None = None,
+    ) -> tuple[float, float, float]:
         idx_all = np.arange(rollout.size, dtype=np.int32)
         actor_losses: list[float] = []
         critic_losses: list[float] = []
@@ -219,7 +230,26 @@ class PPOTruckCancellationOptimiser:
         if self.cfg.normalize_advantages:
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        for _ in range(self.cfg.ppo_epochs):
+        n_minibatches = int(np.ceil(float(rollout.size) / float(max(1, self.cfg.minibatch_size))))
+        total_inner_steps = int(max(1, self.cfg.ppo_epochs * n_minibatches))
+        heartbeat_enabled = total_inner_steps >= 2000
+        heartbeat_every = int(max(1, total_inner_steps // 10))
+        inner_step = 0
+        t_inner = time.perf_counter()
+
+        if heartbeat_enabled:
+            update_label = (
+                f"{int(update_idx)}/{int(total_updates)}"
+                if update_idx is not None and total_updates is not None
+                else "?"
+            )
+            print(
+                f"[PPO] update={update_label} inner_loop_start "
+                f"(epochs={self.cfg.ppo_epochs}, minibatches_per_epoch={n_minibatches}, "
+                f"minibatch_size={self.cfg.minibatch_size}, total_steps={total_inner_steps})"
+            )
+
+        for _epoch in range(self.cfg.ppo_epochs):
             self.rng.shuffle(idx_all)
             for start in range(0, rollout.size, self.cfg.minibatch_size):
                 stop = min(rollout.size, start + self.cfg.minibatch_size)
@@ -270,6 +300,15 @@ class PPOTruckCancellationOptimiser:
                 actor_losses.append(float(actor_loss.numpy()))
                 critic_losses.append(float(critic_loss.numpy()))
                 entropies.append(float(entropy.numpy()))
+                inner_step += 1
+
+                if heartbeat_enabled and (inner_step % heartbeat_every == 0 or inner_step == total_inner_steps):
+                    elapsed = time.perf_counter() - t_inner
+                    pct = 100.0 * float(inner_step) / float(total_inner_steps)
+                    print(
+                        f"[PPO] inner_progress={inner_step}/{total_inner_steps} "
+                        f"({pct:.1f}%) elapsed={_format_minutes_seconds(elapsed)}"
+                    )
 
         return (
             float(np.mean(actor_losses)) if actor_losses else 0.0,
@@ -812,12 +851,33 @@ class PPOTruckCancellationOptimiser:
         critic_thr = float(self.cfg.early_stop_critic_slope_threshold)
 
         for update in range(1, self.cfg.updates + 1):
+            print(
+                f"[PPO] update={update:4d}/{self.cfg.updates} "
+                f"start rollout(batch={self.cfg.rollout_size})"
+            )
+            t_rollout = time.perf_counter()
             rollout = self.env.collect_rollout(
                 policy=self.policy,
                 value_fn=self.value_fn,
                 batch_size=self.cfg.rollout_size,
             )
-            actor_loss, critic_loss, entropy = self._ppo_update(rollout)
+            rollout_elapsed = time.perf_counter() - t_rollout
+            print(
+                f"[PPO] update={update:4d}/{self.cfg.updates} "
+                f"rollout_done in {_format_minutes_seconds(rollout_elapsed)} ({rollout_elapsed:.1f}s)"
+            )
+
+            t_update_inner = time.perf_counter()
+            actor_loss, critic_loss, entropy = self._ppo_update(
+                rollout,
+                update_idx=update,
+                total_updates=self.cfg.updates,
+            )
+            inner_elapsed = time.perf_counter() - t_update_inner
+            print(
+                f"[PPO] update={update:4d}/{self.cfg.updates} "
+                f"inner_update_done in {_format_minutes_seconds(inner_elapsed)} ({inner_elapsed:.1f}s)"
+            )
             actor_loss_trace.append(float(actor_loss))
             critic_loss_trace.append(float(critic_loss))
             rollout_reward_mean = float(np.mean(rollout.rewards))

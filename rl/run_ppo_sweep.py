@@ -2,6 +2,7 @@
 """Run PPO sweeps from config_ppo.json and summarize trial results.
 
 Output layout under the selected run directory:
+- `data/`: generated synthetic dataset used by trials
 - `trials/`: one folder per trial run (model artifacts, metrics, history)
 - `logs/`: one log file per trial
 - `summary/`: aggregate JSON/CSV, overview plots, LaTeX hyperparameter table
@@ -11,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
+import math
 import os
 import random
 import shutil
@@ -21,6 +24,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+import pandas as pd
 
 try:
     from .config_ppo import default_config_path, list_stage_trials, load_config
@@ -103,6 +109,376 @@ def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def _format_minutes_seconds(seconds: float) -> str:
+    total_seconds = max(0, int(round(float(seconds))))
+    minutes, rem = divmod(total_seconds, 60)
+    return f"{minutes}m {rem:02d}s"
+
+
+def _load_module_from_path(module_name: str, module_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, str(module_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module spec from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[attr-defined]
+    return module
+
+
+def _load_toy_modules(toy_sim_dir: Path):
+    cfg_module = _load_module_from_path("toy_sim_config_sweep", toy_sim_dir / "config.py")
+
+    # toy_sim/core.py imports `from config import ...`, so temporarily provide that alias.
+    prev_config_module = sys.modules.get("config")
+    sys.modules["config"] = cfg_module
+    try:
+        core_module = _load_module_from_path("toy_sim_core_sweep", toy_sim_dir / "core.py")
+    finally:
+        if prev_config_module is not None:
+            sys.modules["config"] = prev_config_module
+        else:
+            sys.modules.pop("config", None)
+
+    return cfg_module, core_module
+
+
+def _build_raw_save_columns(
+    sorting_centers: list[str],
+    parcel_types: list[str],
+    n_hours: int,
+) -> list[str]:
+    save_columns = ["center", "day", "season", "hist_avg_vol_tot", "hist_std_vol_tot"]
+    save_columns += [f"vol_h{hour}" for hour in range(int(n_hours))]
+    destination_suffixes = [
+        "_n_exp_trucks",
+        "_frac_last_truck_needed",
+        "_hist_avg_vol",
+        "_hist_std_vol",
+        "_overflow",
+        "_last_truck_needed",
+    ]
+    for dest in sorting_centers:
+        for parcel_type in parcel_types:
+            save_columns.append(f"{dest}_{parcel_type}")
+        for suffix in destination_suffixes:
+            save_columns.append(f"{dest}{suffix}")
+    return save_columns
+
+
+def _resolve_data_dir(output_root: Path, data_dir_arg: str | None) -> Path:
+    if data_dir_arg is None:
+        return (output_root / "data").resolve()
+
+    p = Path(data_dir_arg).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return (output_root / p).resolve()
+
+
+def _float_to_int_if_close(value: float, tol: float = 1e-6) -> int | float:
+    rounded = int(round(float(value)))
+    if abs(float(value) - float(rounded)) <= float(tol):
+        return rounded
+    return float(value)
+
+
+def _summarize_days_from_raw_df(df_raw: pd.DataFrame) -> dict[str, Any]:
+    if not isinstance(df_raw, pd.DataFrame):
+        raise TypeError("Expected pandas DataFrame for raw dataset summary.")
+
+    center_day_rows = int(df_raw.shape[0])
+    centers: list[str] = []
+    per_center_counts: dict[str, int] = {}
+    if "center" in df_raw.columns:
+        center_values = df_raw["center"].astype(str)
+        centers = sorted(center_values.unique().tolist())
+        counts = center_values.value_counts().sort_index()
+        per_center_counts = {str(k): int(v) for k, v in counts.items()}
+
+    n_centers = len(centers)
+    inferred_global_days: int | float | None = None
+    min_rows_per_center: int | None = None
+    max_rows_per_center: int | None = None
+    if per_center_counts:
+        values = list(per_center_counts.values())
+        min_rows_per_center = int(min(values))
+        max_rows_per_center = int(max(values))
+        inferred_global_days = _float_to_int_if_close(float(np.mean(values)))
+
+    return {
+        "source": "raw",
+        "center_day_rows": int(center_day_rows),
+        "n_centers": int(n_centers),
+        "centers": centers,
+        "per_center_rows": per_center_counts,
+        "min_rows_per_center": min_rows_per_center,
+        "max_rows_per_center": max_rows_per_center,
+        "inferred_global_days": inferred_global_days,
+    }
+
+
+def _summarize_days_from_macro_dfs(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict[str, Any]:
+    if not isinstance(train_df, pd.DataFrame) or not isinstance(test_df, pd.DataFrame):
+        raise TypeError("Expected pandas DataFrames for macro dataset summary.")
+
+    macro_df = pd.concat([train_df, test_df], ignore_index=True)
+    required_cols = {"center", "dest", "hour"}
+    if not required_cols.issubset(set(macro_df.columns)):
+        missing = sorted(required_cols - set(macro_df.columns))
+        raise ValueError(f"Missing required columns for macro day summary: {missing}")
+
+    macro_df = macro_df.copy()
+    macro_df["center"] = macro_df["center"].astype(str)
+    macro_df["dest"] = macro_df["dest"].astype(str)
+    macro_df["hour"] = pd.to_numeric(macro_df["hour"], errors="coerce")
+    macro_df = macro_df.dropna(subset=["hour"])
+    if macro_df.empty:
+        raise ValueError("Macro dataset has no valid hour values for day summary.")
+
+    centers = sorted(macro_df["center"].unique().tolist())
+    per_center_days: dict[str, int | float] = {}
+    center_day_rows_total = 0.0
+    for center in centers:
+        sub = macro_df[macro_df["center"] == center]
+        rows_center = float(sub.shape[0])
+        n_dest = int(sub["dest"].nunique())
+        n_hours = int(sub["hour"].nunique())
+        denom = float(n_dest * n_hours)
+        if denom <= 0.0:
+            continue
+        center_days = rows_center / denom
+        center_days = _float_to_int_if_close(center_days)
+        per_center_days[str(center)] = center_days
+        center_day_rows_total += float(center_days)
+
+    n_centers = len(per_center_days)
+    inferred_global_days: int | float | None = None
+    min_rows_per_center: int | float | None = None
+    max_rows_per_center: int | float | None = None
+    if per_center_days:
+        values = [float(v) for v in per_center_days.values()]
+        inferred_global_days = _float_to_int_if_close(float(np.mean(values)))
+        min_rows_per_center = _float_to_int_if_close(float(np.min(values)))
+        max_rows_per_center = _float_to_int_if_close(float(np.max(values)))
+
+    return {
+        "source": "macro_estimate",
+        "center_day_rows": _float_to_int_if_close(center_day_rows_total),
+        "n_centers": int(n_centers),
+        "centers": sorted(per_center_days.keys()),
+        "per_center_rows": per_center_days,
+        "min_rows_per_center": min_rows_per_center,
+        "max_rows_per_center": max_rows_per_center,
+        "inferred_global_days": inferred_global_days,
+    }
+
+
+def _summarize_days_from_existing_files(raw_path: Path, train_path: Path, test_path: Path) -> dict[str, Any]:
+    if raw_path.exists():
+        try:
+            raw_df = pd.read_pickle(raw_path)
+            if isinstance(raw_df, pd.DataFrame):
+                return _summarize_days_from_raw_df(raw_df)
+        except Exception as exc:
+            print(f"[DATA] Warning: failed to read raw dataset for day summary: {exc}")
+
+    try:
+        train_df = pd.read_pickle(train_path)
+        test_df = pd.read_pickle(test_path)
+        if isinstance(train_df, pd.DataFrame) and isinstance(test_df, pd.DataFrame):
+            return _summarize_days_from_macro_dfs(train_df=train_df, test_df=test_df)
+    except Exception as exc:
+        print(f"[DATA] Warning: failed to estimate days from macro train/test data: {exc}")
+
+    return {
+        "source": "unknown",
+        "center_day_rows": None,
+        "n_centers": None,
+        "centers": [],
+        "per_center_rows": {},
+        "min_rows_per_center": None,
+        "max_rows_per_center": None,
+        "inferred_global_days": None,
+    }
+
+
+def _log_day_summary(day_summary: dict[str, Any], context: str) -> None:
+    center_day_rows = day_summary.get("center_day_rows")
+    n_centers = day_summary.get("n_centers")
+    inferred_global_days = day_summary.get("inferred_global_days")
+    source = day_summary.get("source", "unknown")
+
+    if center_day_rows is None:
+        print(f"[DATA] {context}: unable to infer day counts (source={source}).")
+        return
+
+    print(
+        f"[DATA] {context}: center_day_rows={center_day_rows}, "
+        f"n_centers={n_centers}, inferred_global_days={inferred_global_days} "
+        f"(source={source})"
+    )
+
+    min_rows = day_summary.get("min_rows_per_center")
+    max_rows = day_summary.get("max_rows_per_center")
+    if min_rows is not None and max_rows is not None:
+        print(f"[DATA] {context}: per_center_rows_min={min_rows}, per_center_rows_max={max_rows}")
+
+
+def _ensure_generated_dataset(
+    output_root: Path,
+    data_dir_arg: str | None,
+    overwrite_data: bool,
+    sim_correlation_dest: float,
+    sim_correlation_type: float,
+    sim_n_weeks: int,
+    sim_n_weeks_high_season: int,
+    sim_margin: float,
+    sim_train_test_ratio: float,
+    sim_random_seed: int,
+    sim_n_parcels_per_truck: int,
+) -> dict[str, Any]:
+    data_dir = _resolve_data_dir(output_root=output_root, data_dir_arg=data_dir_arg)
+    raw_path = data_dir / "df_raw.pkl"
+    train_path = data_dir / "df_per_dest_train.pkl"
+    test_path = data_dir / "df_per_dest_test.pkl"
+    info_path = data_dir / "dataset_info.json"
+
+    t0 = time.time()
+    print(f"[DATA] dataset_dir={data_dir}")
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    required_paths = [train_path, test_path]
+    has_existing = all(p.exists() for p in required_paths)
+    if has_existing and not overwrite_data:
+        elapsed = time.time() - t0
+        day_summary = _summarize_days_from_existing_files(
+            raw_path=raw_path,
+            train_path=train_path,
+            test_path=test_path,
+        )
+        print("[DATA] Found existing train/test dataset files; skipping generation.")
+        print(f"[DATA] train_path={train_path}")
+        print(f"[DATA] test_path={test_path}")
+        _log_day_summary(day_summary=day_summary, context="read_data_days")
+        print(f"[DATA] reuse_time={_format_minutes_seconds(elapsed)} ({elapsed:.1f}s)")
+        return {
+            "data_dir": str(data_dir),
+            "raw_path": str(raw_path),
+            "train_path": str(train_path),
+            "test_path": str(test_path),
+            "generated": False,
+            "overwritten": False,
+            "elapsed_s": float(elapsed),
+            "day_summary": day_summary,
+        }
+
+    if has_existing and overwrite_data:
+        print("[DATA] --overwrite-data set: regenerating existing dataset files.")
+    else:
+        print("[DATA] No existing dataset found: generating synthetic data.")
+
+    if not (0.0 < float(sim_train_test_ratio) < 1.0):
+        raise ValueError("--sim-train-test-ratio must be in (0, 1)")
+
+    repo_root = Path(__file__).resolve().parents[1]
+    toy_sim_dir = repo_root / "toy_sim"
+    toy_cfg, toy_core = _load_toy_modules(toy_sim_dir)
+    toy_cfg.validate_shapes()
+    day_cfg = toy_cfg.build_day_configuration()
+
+    print(
+        "[DATA] generation_params="
+        f"(corr_dest={float(sim_correlation_dest):.3f}, corr_type={float(sim_correlation_type):.3f}, "
+        f"n_weeks={int(sim_n_weeks)}, n_weeks_high={int(sim_n_weeks_high_season)}, "
+        f"margin={float(sim_margin):.3f}, test_ratio={float(sim_train_test_ratio):.3f}, "
+        f"seed={int(sim_random_seed)}, parcels_per_truck={int(sim_n_parcels_per_truck)})"
+    )
+
+    np.random.seed(int(sim_random_seed))
+    df_raw = toy_core.generate_raw_data(
+        data_dict=day_cfg,
+        corr_dest=float(sim_correlation_dest),
+        corr_type=float(sim_correlation_type),
+        n_parcels_per_truck=int(sim_n_parcels_per_truck),
+        n_weeks=int(sim_n_weeks),
+        n_weeks_high_season=int(sim_n_weeks_high_season),
+        margin=float(sim_margin),
+    )
+
+    n_rows = int(df_raw.shape[0])
+    if n_rows < 2:
+        raise ValueError(f"Generated dataframe too small for split: n_rows={n_rows}")
+
+    n_test = int(math.ceil(float(sim_train_test_ratio) * n_rows))
+    n_test = max(1, min(n_rows - 1, n_test))
+    rng = np.random.default_rng(int(sim_random_seed))
+    perm = rng.permutation(n_rows)
+    idx_test = perm[:n_test]
+    idx_train = perm[n_test:]
+
+    train_df_raw = df_raw.iloc[idx_train]
+    test_df_raw = df_raw.iloc[idx_test]
+    train_df = toy_core.create_macro_stat_dataset_all_origins(train_df_raw)
+    test_df = toy_core.create_macro_stat_dataset_all_origins(test_df_raw)
+    day_summary = _summarize_days_from_raw_df(df_raw)
+
+    save_columns = _build_raw_save_columns(
+        sorting_centers=list(toy_cfg.SORTING_CENTERS),
+        parcel_types=list(toy_cfg.PARCEL_TYPES),
+        n_hours=int(toy_core.N_HOURS),
+    )
+    df_raw[save_columns].to_pickle(raw_path)
+    train_df.to_pickle(train_path)
+    test_df.to_pickle(test_path)
+
+    elapsed = time.time() - t0
+    info_payload = {
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "data_dir": str(data_dir),
+        "raw_path": str(raw_path),
+        "train_path": str(train_path),
+        "test_path": str(test_path),
+        "generated": True,
+        "overwritten": bool(overwrite_data and has_existing),
+        "elapsed_s": float(elapsed),
+        "elapsed_human": _format_minutes_seconds(elapsed),
+        "simulation": {
+            "correlation_dest": float(sim_correlation_dest),
+            "correlation_type": float(sim_correlation_type),
+            "n_weeks": int(sim_n_weeks),
+            "n_weeks_high_season": int(sim_n_weeks_high_season),
+            "margin": float(sim_margin),
+            "train_test_ratio": float(sim_train_test_ratio),
+            "random_seed": int(sim_random_seed),
+            "n_parcels_per_truck": int(sim_n_parcels_per_truck),
+        },
+        "counts": {
+            "raw_rows": int(df_raw.shape[0]),
+            "train_rows": int(train_df.shape[0]),
+            "test_rows": int(test_df.shape[0]),
+        },
+        "day_summary": day_summary,
+    }
+    _write_json(info_path, info_payload)
+
+    print(f"[DATA] Wrote raw_path={raw_path}")
+    print(f"[DATA] Wrote train_path={train_path}")
+    print(f"[DATA] Wrote test_path={test_path}")
+    print(f"[DATA] Wrote info={info_path}")
+    _log_day_summary(day_summary=day_summary, context="generated_data_days")
+    print(f"[DATA] generation_time={_format_minutes_seconds(elapsed)} ({elapsed:.1f}s)")
+
+    return {
+        "data_dir": str(data_dir),
+        "raw_path": str(raw_path),
+        "train_path": str(train_path),
+        "test_path": str(test_path),
+        "generated": True,
+        "overwritten": bool(overwrite_data and has_existing),
+        "elapsed_s": float(elapsed),
+        "day_summary": day_summary,
+    }
 
 
 def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -469,6 +845,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional named sweep folder inside output root (example: piperun_1)",
     )
     parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Synthetic dataset directory. Relative paths resolve under run output root (default: data).",
+    )
+    parser.add_argument(
+        "--overwrite-data",
+        action="store_true",
+        help="Regenerate synthetic train/test data even if dataset files already exist.",
+    )
+    parser.add_argument("--sim-correlation-dest", type=float, default=0.9, help="Destination correlation for simulation.")
+    parser.add_argument("--sim-correlation-type", type=float, default=0.3, help="Parcel-type correlation for simulation.")
+    parser.add_argument("--sim-n-weeks", type=int, default=100, help="Number of low-season weeks to simulate.")
+    parser.add_argument(
+        "--sim-n-weeks-high-season",
+        type=int,
+        default=10,
+        help="Number of high-season weeks to simulate.",
+    )
+    parser.add_argument("--sim-margin", type=float, default=0.0, help="Need/overflow margin used in simulation.")
+    parser.add_argument(
+        "--sim-train-test-ratio",
+        type=float,
+        default=0.2,
+        help="Fraction of generated daily rows assigned to test split.",
+    )
+    parser.add_argument("--sim-random-seed", type=int, default=42, help="Random seed for simulation and split.")
+    parser.add_argument(
+        "--sim-n-parcels-per-truck",
+        type=int,
+        default=100,
+        help="Truck capacity used during data generation.",
+    )
+    parser.add_argument(
         "--python-bin",
         type=str,
         default=None,
@@ -508,7 +918,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args, passthrough_args = parser.parse_known_args()
 
     config_path = Path(args.config).expanduser().resolve()
     cfg = load_config(config_path)
@@ -550,6 +961,8 @@ def main() -> None:
 
     python_bin = args.python_bin or cfg.get("python_bin") or sys.executable
     extra_args = list(args.extra_arg or [])
+    if passthrough_args:
+        extra_args.extend(passthrough_args)
 
     print(
         f"[SWEEP] config={config_path} stage={stage_name} "
@@ -557,9 +970,49 @@ def main() -> None:
     )
     print(f"[SWEEP] output_root={output_root}")
     print(f"[SWEEP] python={python_bin}")
+    if passthrough_args:
+        print(f"[SWEEP] forwarding_unknown_args_to_optimiser={passthrough_args}")
 
     rows: list[dict[str, Any]] = []
     t0 = time.time()
+    if args.dry_run:
+        data_dir = _resolve_data_dir(output_root=output_root, data_dir_arg=args.data_dir)
+        data_info = {
+            "data_dir": str(data_dir),
+            "raw_path": str(data_dir / "df_raw.pkl"),
+            "train_path": str(data_dir / "df_per_dest_train.pkl"),
+            "test_path": str(data_dir / "df_per_dest_test.pkl"),
+            "generated": False,
+            "overwritten": False,
+            "elapsed_s": 0.0,
+            "day_summary": {
+                "source": "dry_run",
+                "center_day_rows": None,
+                "n_centers": None,
+                "centers": [],
+                "per_center_rows": {},
+                "min_rows_per_center": None,
+                "max_rows_per_center": None,
+                "inferred_global_days": None,
+            },
+        }
+        print("[DATA] dry_run enabled: skipping dataset generation/reuse checks.")
+        print(f"[DATA] expected_train_path={data_info['train_path']}")
+        print(f"[DATA] expected_test_path={data_info['test_path']}")
+    else:
+        data_info = _ensure_generated_dataset(
+            output_root=output_root,
+            data_dir_arg=args.data_dir,
+            overwrite_data=bool(args.overwrite_data),
+            sim_correlation_dest=float(args.sim_correlation_dest),
+            sim_correlation_type=float(args.sim_correlation_type),
+            sim_n_weeks=int(args.sim_n_weeks),
+            sim_n_weeks_high_season=int(args.sim_n_weeks_high_season),
+            sim_margin=float(args.sim_margin),
+            sim_train_test_ratio=float(args.sim_train_test_ratio),
+            sim_random_seed=int(args.sim_random_seed),
+            sim_n_parcels_per_truck=int(args.sim_n_parcels_per_truck),
+        )
 
     for rank_in_order, trial_idx in enumerate(indices, start=1):
         trial_cfg = trials[trial_idx]
@@ -577,6 +1030,10 @@ def main() -> None:
             str(stage_name),
             "--trial-index",
             str(trial_idx),
+            "--train-path",
+            str(data_info["train_path"]),
+            "--test-path",
+            str(data_info["test_path"]),
             "--output-dir",
             str(run_dir),
         ] + extra_args
@@ -590,6 +1047,8 @@ def main() -> None:
             "runtime_s": 0.0,
             "return_code": None,
             "run_dir": str(run_dir),
+            "train_path": str(data_info["train_path"]),
+            "test_path": str(data_info["test_path"]),
             "command": cmd,
         }
 
@@ -643,7 +1102,8 @@ def main() -> None:
         rows.append(record)
         print(
             f"[SWEEP] trial={trial_idx} status={record['status']} "
-            f"objective={record['objective']} runtime={runtime_s:.1f}s"
+            f"objective={record['objective']} "
+            f"runtime={_format_minutes_seconds(runtime_s)} ({runtime_s:.1f}s)"
         )
 
     valid_rows = [r for r in rows if r.get("objective") is not None]
@@ -653,6 +1113,7 @@ def main() -> None:
     for row in rows:
         row["rank"] = rank_map.get(id(row))
 
+    elapsed_total = time.time() - t0
     best_trial_index = int(valid_rows_sorted[0]["trial_index"]) if valid_rows_sorted else None
     summary = {
         "config": str(config_path),
@@ -661,8 +1122,29 @@ def main() -> None:
         "objective_mode": args.objective_mode,
         "n_trials_total": len(trials),
         "n_trials_selected": len(indices),
-        "elapsed_s": time.time() - t0,
+        "elapsed_s": float(elapsed_total),
+        "elapsed_human": _format_minutes_seconds(elapsed_total),
         "output_root": str(output_root),
+        "dataset": {
+            "data_dir": str(data_info["data_dir"]),
+            "raw_path": str(data_info["raw_path"]),
+            "train_path": str(data_info["train_path"]),
+            "test_path": str(data_info["test_path"]),
+            "generated": bool(data_info["generated"]),
+            "overwritten": bool(data_info["overwritten"]),
+            "elapsed_s": float(data_info["elapsed_s"]),
+            "elapsed_human": _format_minutes_seconds(float(data_info["elapsed_s"])),
+            "overwrite_data_requested": bool(args.overwrite_data),
+            "sim_correlation_dest": float(args.sim_correlation_dest),
+            "sim_correlation_type": float(args.sim_correlation_type),
+            "sim_n_weeks": int(args.sim_n_weeks),
+            "sim_n_weeks_high_season": int(args.sim_n_weeks_high_season),
+            "sim_margin": float(args.sim_margin),
+            "sim_train_test_ratio": float(args.sim_train_test_ratio),
+            "sim_random_seed": int(args.sim_random_seed),
+            "sim_n_parcels_per_truck": int(args.sim_n_parcels_per_truck),
+            "day_summary": data_info.get("day_summary"),
+        },
         "trials_dir": str(trials_root),
         "logs_dir": str(logs_root),
         "summary_dir": str(summary_dir),
@@ -709,6 +1191,7 @@ def main() -> None:
         f"into {summary_dir / 'trial_plots'}"
     )
     print(f"[SWEEP] Wrote plots in: {summary_dir / 'plots'}")
+    print(f"[SWEEP] Total runtime: {_format_minutes_seconds(elapsed_total)} ({elapsed_total:.1f}s)")
     if valid_rows_sorted:
         best = valid_rows_sorted[0]
         print(
