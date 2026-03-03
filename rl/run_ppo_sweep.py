@@ -2,10 +2,12 @@
 """Run PPO sweeps from config_ppo.json and summarize trial results.
 
 Output layout under the selected run directory:
-- `data/`: generated synthetic dataset used by trials
-- `trials/`: one folder per trial run (model artifacts, metrics, history)
-- `logs/`: one log file per trial
+- `trial_XXX/`: one folder per trial (artifacts + trial log + trial config)
 - `summary/`: aggregate JSON/CSV, overview plots, LaTeX hyperparameter table
+
+Shared synthetic data is stored separately by default:
+- if run folder is `<name>_ppo`, data goes to sibling `<name>/data`
+- otherwise data goes to `<run-folder>/data`
 """
 
 from __future__ import annotations
@@ -117,6 +119,13 @@ def _format_minutes_seconds(seconds: float) -> str:
     return f"{minutes}m {rem:02d}s"
 
 
+def _format_hours_minutes_seconds(seconds: float) -> str:
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}h {minutes:02d}m {secs:02d}s"
+
+
 def _load_module_from_path(module_name: str, module_path: Path):
     spec = importlib.util.spec_from_file_location(module_name, str(module_path))
     if spec is None or spec.loader is None:
@@ -168,6 +177,11 @@ def _build_raw_save_columns(
 
 def _resolve_data_dir(output_root: Path, data_dir_arg: str | None) -> Path:
     if data_dir_arg is None:
+        run_name = output_root.name
+        suffix = "_ppo"
+        if run_name.endswith(suffix) and len(run_name) > len(suffix):
+            shared_run_name = run_name[: -len(suffix)]
+            return (output_root.parent / shared_run_name / "data").resolve()
         return (output_root / "data").resolve()
 
     p = Path(data_dir_arg).expanduser()
@@ -325,6 +339,318 @@ def _log_day_summary(day_summary: dict[str, Any], context: str) -> None:
         print(f"[DATA] {context}: per_center_rows_min={min_rows}, per_center_rows_max={max_rows}")
 
 
+def _write_dataset_plots(raw_path: Path, data_root: Path, n_parcels_per_truck: int = 100) -> dict[str, Any]:
+    """Write lightweight dataset overview plots into <data_root>/plots."""
+    result: dict[str, Any] = {
+        "status": "skipped_missing_raw",
+        "plots_dir": str((data_root / "plots").resolve()),
+        "generated": [],
+    }
+    if not raw_path.exists():
+        return result
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        result["status"] = "skipped_missing_matplotlib"
+        return result
+
+    try:
+        raw_obj = pd.read_pickle(raw_path)
+    except Exception as exc:
+        result["status"] = "failed_read_raw"
+        result["error"] = str(exc)
+        return result
+    if not isinstance(raw_obj, pd.DataFrame):
+        result["status"] = "invalid_raw_dataframe"
+        return result
+
+    df_raw = raw_obj
+    plots_dir = (data_root / "plots").resolve()
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    generated: list[str] = []
+    truck_capacity = max(1, int(n_parcels_per_truck))
+
+    # Histogram of daily total processed volume.
+    if "day_total2" in df_raw.columns:
+        vals = pd.to_numeric(df_raw["day_total2"], errors="coerce").dropna().to_numpy(dtype=float)
+        if vals.size > 0:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.hist(vals, bins=min(40, max(10, int(np.sqrt(vals.size)))), alpha=0.8, color="tab:blue")
+            ax.set_title("Histogram of day_total2")
+            ax.set_xlabel("day_total2")
+            ax.set_ylabel("count")
+            ax.grid(alpha=0.2)
+            fig.tight_layout()
+            out = plots_dir / "hist_day_total2.png"
+            fig.savefig(out, dpi=140)
+            plt.close(fig)
+            generated.append(str(out))
+
+    # Mean daily total by sorting center.
+    if {"center", "day_total2"}.issubset(set(df_raw.columns)):
+        center_df = (
+            df_raw[["center", "day_total2"]]
+            .assign(day_total2=pd.to_numeric(df_raw["day_total2"], errors="coerce"))
+            .dropna(subset=["day_total2"])
+            .groupby("center")["day_total2"]
+            .mean()
+            .sort_index()
+        )
+        if not center_df.empty:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(center_df.index.astype(str), center_df.values, color="tab:orange")
+            ax.set_title("Mean day_total2 by center")
+            ax.set_xlabel("center")
+            ax.set_ylabel("mean day_total2")
+            ax.grid(axis="y", alpha=0.2)
+            fig.tight_layout()
+            out = plots_dir / "mean_day_total2_by_center.png"
+            fig.savefig(out, dpi=140)
+            plt.close(fig)
+            generated.append(str(out))
+
+    # Hourly volume distributions by center + mean hourly profile from vol_h* columns.
+    vol_cols = [c for c in df_raw.columns if c.startswith("vol_h")]
+    if vol_cols:
+        vol_cols_sorted = sorted(
+            vol_cols,
+            key=lambda c: int(c[5:]) if c[5:].isdigit() else c,
+        )
+        numeric = df_raw[vol_cols_sorted].apply(pd.to_numeric, errors="coerce")
+        if "center" in df_raw.columns:
+            center_series = df_raw["center"].astype(str)
+            centers = sorted(center_series.dropna().unique().tolist())
+            for center in centers:
+                center_numeric = numeric.loc[center_series == center]
+                if center_numeric.empty:
+                    continue
+
+                hour_payload: list[tuple[str, np.ndarray]] = []
+                for col in vol_cols_sorted:
+                    vals = center_numeric[col].dropna().to_numpy(dtype=float)
+                    if vals.size == 0:
+                        continue
+                    hour_token = col[5:] if col.startswith("vol_h") else col
+                    hour_token = "".join(ch for ch in str(hour_token) if ch.isalnum() or ch in {"_", "-"})
+                    if not hour_token:
+                        continue
+                    hour_payload.append((hour_token, vals))
+
+                if not hour_payload:
+                    continue
+
+                n_panels = len(hour_payload)
+                n_cols = int(math.ceil(math.sqrt(n_panels)))
+                n_rows = int(math.ceil(n_panels / n_cols))
+                fig, axes = plt.subplots(
+                    n_rows,
+                    n_cols,
+                    figsize=(4.4 * n_cols, 3.6 * n_rows),
+                    squeeze=False,
+                )
+                flat_axes = axes.flatten()
+                for idx, (hour_token, vals) in enumerate(hour_payload):
+                    ax = flat_axes[idx]
+                    ax.hist(
+                        vals,
+                        bins=min(40, max(10, int(np.sqrt(vals.size)))),
+                        alpha=0.8,
+                        color="tab:blue",
+                    )
+                    ax.set_title(f"h{hour_token}")
+                    ax.set_xlabel("generated total volume")
+                    ax.set_ylabel("count")
+                    ax.grid(alpha=0.2)
+                for ax in flat_axes[n_panels:]:
+                    ax.axis("off")
+
+                fig.suptitle(f"Center {center} hourly total volume distributions")
+                fig.tight_layout(rect=[0, 0, 1, 0.97])
+                center_token = "".join(ch for ch in str(center) if ch.isalnum() or ch in {"_", "-"})
+                if not center_token:
+                    center_token = "unknown"
+                out = plots_dir / f"center_{center_token}_hourly_volume.pdf"
+                fig.savefig(out)
+                plt.close(fig)
+                generated.append(str(out))
+
+        means = numeric.mean(axis=0, skipna=True).to_numpy(dtype=float)
+        if means.size > 0 and np.isfinite(means).any():
+            hours = np.arange(means.size, dtype=int)
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(hours, means, marker="o", linewidth=1.2, color="tab:green")
+            ax.set_title("Mean hourly volume profile")
+            ax.set_xlabel("hour")
+            ax.set_ylabel("mean volume")
+            ax.grid(alpha=0.2)
+            fig.tight_layout()
+            out = plots_dir / "mean_hourly_volume_profile.png"
+            fig.savefig(out, dpi=140)
+            plt.close(fig)
+            generated.append(str(out))
+
+    # Per-center route volume grids with booked-capacity marker.
+    # Prefer *_total2 if present; otherwise reconstruct generated route volume from
+    # saved parcel-type columns (e.g. "<dest>_typeA", "<dest>_typeB").
+    total2_suffix = "_total2"
+    total2_cols = [
+        c
+        for c in df_raw.columns
+        if c.endswith(total2_suffix) and c not in {"day_total2", "total_overflow"}
+    ]
+    truck_suffix = "_n_exp_trucks"
+    truck_cols = [c for c in df_raw.columns if c.endswith(truck_suffix)]
+    if "center" in df_raw.columns and truck_cols:
+        center_series = df_raw["center"].astype(str)
+        centers = sorted(center_series.dropna().unique().tolist())
+        dest_names = sorted({c[: -len(truck_suffix)] for c in truck_cols})
+        known_stat_suffixes = {
+            "n_exp_trucks",
+            "frac_last_truck_needed",
+            "hist_avg_vol",
+            "hist_std_vol",
+            "overflow",
+            "last_truck_needed",
+            "total",
+            "total2",
+        }
+        for center in centers:
+            center_df = df_raw[center_series == center]
+            if center_df.empty:
+                continue
+            route_payload: list[tuple[str, np.ndarray, np.ndarray | None, np.ndarray]] = []
+            for dest in dest_names:
+                if dest == center:
+                    continue
+                vol_col = f"{dest}_total2"
+                base_col = f"{dest}_total"
+                overflow_col = f"{dest}_overflow"
+                truck_col = f"{dest}_n_exp_trucks"
+                if truck_col not in center_df.columns:
+                    continue
+
+                lane = pd.DataFrame(index=center_df.index)
+                lane[truck_col] = pd.to_numeric(center_df[truck_col], errors="coerce")
+
+                if base_col in center_df.columns:
+                    lane["__base_volume"] = pd.to_numeric(center_df[base_col], errors="coerce")
+                else:
+                    prefix = f"{dest}_"
+                    parcel_cols = []
+                    for col in center_df.columns:
+                        if not col.startswith(prefix):
+                            continue
+                        suffix = col[len(prefix) :]
+                        if suffix in known_stat_suffixes:
+                            continue
+                        parcel_cols.append(col)
+
+                    if not parcel_cols:
+                        continue
+                    lane[parcel_cols] = center_df[parcel_cols].apply(pd.to_numeric, errors="coerce")
+                    lane["__base_volume"] = lane[parcel_cols].sum(axis=1, min_count=1)
+
+                if vol_col in center_df.columns:
+                    lane["__with_carry"] = pd.to_numeric(center_df[vol_col], errors="coerce")
+                elif overflow_col in center_df.columns:
+                    # Fallback for saved raw schema: approximate carry-over overlay with base + overflow.
+                    overflow_vals = pd.to_numeric(center_df[overflow_col], errors="coerce")
+                    lane["__with_carry"] = lane["__base_volume"] + overflow_vals.fillna(0.0)
+
+                lane = lane.dropna(subset=["__base_volume", truck_col])
+                if lane.empty:
+                    continue
+
+                carry_vals: np.ndarray | None = None
+                if "__with_carry" in lane.columns:
+                    carry_series = lane["__with_carry"].dropna()
+                    if len(carry_series) > 0:
+                        carry_vals = carry_series.to_numpy(dtype=float)
+
+                route_payload.append(
+                    (
+                        dest,
+                        lane["__base_volume"].to_numpy(dtype=float),
+                        carry_vals,
+                        lane[truck_col].to_numpy(dtype=float),
+                    )
+                )
+
+            if not route_payload:
+                continue
+
+            n_panels = len(route_payload)
+            n_cols = int(math.ceil(math.sqrt(n_panels)))
+            n_rows = int(math.ceil(n_panels / n_cols))
+            fig, axes = plt.subplots(
+                n_rows,
+                n_cols,
+                figsize=(4.4 * n_cols, 3.6 * n_rows),
+                squeeze=False,
+            )
+            flat_axes = axes.flatten()
+
+            for idx, (dest, base_vals, carry_vals, n_exp_vals) in enumerate(route_payload):
+                ax = flat_axes[idx]
+                hist_source = base_vals if carry_vals is None else carry_vals
+                n_bins = min(40, max(10, int(np.sqrt(max(1, hist_source.size)))))
+                bin_edges = np.histogram_bin_edges(hist_source, bins=n_bins)
+                if carry_vals is not None and carry_vals.size > 0:
+                    ax.hist(
+                        carry_vals,
+                        bins=bin_edges,
+                        alpha=1.0,
+                        color="darkorange",
+                        linewidth=0.0,
+                        zorder=1,
+                    )
+                ax.hist(
+                    base_vals,
+                    bins=bin_edges,
+                    alpha=1.0,
+                    color="tab:blue",
+                    linewidth=0.0,
+                    zorder=2,
+                )
+                booked_cap = n_exp_vals * float(truck_capacity)
+                booked_cap = booked_cap[np.isfinite(booked_cap)]
+                if booked_cap.size > 0:
+                    mode_vals = pd.Series(booked_cap).round(6).mode(dropna=True)
+                    if not mode_vals.empty:
+                        line_x = float(mode_vals.iloc[0])
+                        ax.axvline(
+                            line_x,
+                            color="tab:red",
+                            linestyle="--",
+                            linewidth=1.5,
+                        )
+                ax.set_title(f"{center}->{dest}")
+                ax.set_xlabel("daily volume")
+                ax.set_ylabel("count")
+                ax.grid(alpha=0.2)
+
+            for ax in flat_axes[n_panels:]:
+                ax.axis("off")
+
+            fig.suptitle(
+                "Route volume distributions and booked-capacity marker "
+                f"(center={center}, cap={truck_capacity}; blue=base front, orange=with carry-over back)"
+            )
+            fig.tight_layout(rect=[0, 0, 1, 0.97])
+            out = plots_dir / f"center_{center}_dest_volume.pdf"
+            fig.savefig(out)
+            plt.close(fig)
+            generated.append(str(out))
+
+    result["generated"] = generated
+    result["status"] = "ok" if generated else "no_plot_inputs"
+    return result
+
+
 def _ensure_generated_dataset(
     output_root: Path,
     data_dir_arg: str | None,
@@ -339,14 +665,17 @@ def _ensure_generated_dataset(
     sim_n_parcels_per_truck: int,
 ) -> dict[str, Any]:
     data_dir = _resolve_data_dir(output_root=output_root, data_dir_arg=data_dir_arg)
+    data_root = data_dir.parent.resolve()
     raw_path = data_dir / "df_raw.pkl"
     train_path = data_dir / "df_per_dest_train.pkl"
     test_path = data_dir / "df_per_dest_test.pkl"
     info_path = data_dir / "dataset_info.json"
 
     t0 = time.time()
+    print(f"[DATA] data_root={data_root}")
     print(f"[DATA] dataset_dir={data_dir}")
     data_dir.mkdir(parents=True, exist_ok=True)
+    data_root.mkdir(parents=True, exist_ok=True)
 
     required_paths = [train_path, test_path]
     has_existing = all(p.exists() for p in required_paths)
@@ -357,16 +686,28 @@ def _ensure_generated_dataset(
             train_path=train_path,
             test_path=test_path,
         )
+        plot_info = _write_dataset_plots(
+            raw_path=raw_path,
+            data_root=data_root,
+            n_parcels_per_truck=int(sim_n_parcels_per_truck),
+        )
         print("[DATA] Found existing train/test dataset files; skipping generation.")
         print(f"[DATA] train_path={train_path}")
         print(f"[DATA] test_path={test_path}")
+        print(
+            f"[DATA] dataset_plots status={plot_info.get('status')} "
+            f"count={len(plot_info.get('generated', []))} "
+            f"dir={plot_info.get('plots_dir')}"
+        )
         _log_day_summary(day_summary=day_summary, context="read_data_days")
         print(f"[DATA] reuse_time={_format_minutes_seconds(elapsed)} ({elapsed:.1f}s)")
         return {
+            "data_root": str(data_root),
             "data_dir": str(data_dir),
             "raw_path": str(raw_path),
             "train_path": str(train_path),
             "test_path": str(test_path),
+            "plot_info": plot_info,
             "generated": False,
             "overwritten": False,
             "elapsed_s": float(elapsed),
@@ -431,14 +772,21 @@ def _ensure_generated_dataset(
     df_raw[save_columns].to_pickle(raw_path)
     train_df.to_pickle(train_path)
     test_df.to_pickle(test_path)
+    plot_info = _write_dataset_plots(
+        raw_path=raw_path,
+        data_root=data_root,
+        n_parcels_per_truck=int(sim_n_parcels_per_truck),
+    )
 
     elapsed = time.time() - t0
     info_payload = {
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "data_root": str(data_root),
         "data_dir": str(data_dir),
         "raw_path": str(raw_path),
         "train_path": str(train_path),
         "test_path": str(test_path),
+        "plot_info": plot_info,
         "generated": True,
         "overwritten": bool(overwrite_data and has_existing),
         "elapsed_s": float(elapsed),
@@ -465,15 +813,22 @@ def _ensure_generated_dataset(
     print(f"[DATA] Wrote raw_path={raw_path}")
     print(f"[DATA] Wrote train_path={train_path}")
     print(f"[DATA] Wrote test_path={test_path}")
+    print(
+        f"[DATA] dataset_plots status={plot_info.get('status')} "
+        f"count={len(plot_info.get('generated', []))} "
+        f"dir={plot_info.get('plots_dir')}"
+    )
     print(f"[DATA] Wrote info={info_path}")
     _log_day_summary(day_summary=day_summary, context="generated_data_days")
     print(f"[DATA] generation_time={_format_minutes_seconds(elapsed)} ({elapsed:.1f}s)")
 
     return {
+        "data_root": str(data_root),
         "data_dir": str(data_dir),
         "raw_path": str(raw_path),
         "train_path": str(train_path),
         "test_path": str(test_path),
+        "plot_info": plot_info,
         "generated": True,
         "overwritten": bool(overwrite_data and has_existing),
         "elapsed_s": float(elapsed),
@@ -484,6 +839,7 @@ def _ensure_generated_dataset(
 def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields = [
         "rank",
+        "trial_number",
         "trial_index",
         "tag",
         "status",
@@ -494,6 +850,10 @@ def _write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "reward_mean_test_det",
         "accuracy_test_det",
         "cancel_rate_test_det",
+        "cancel_precision_test_det",
+        "cancel_recall_test_det",
+        "cancel_f1_test_det",
+        "cancel_fbeta_beta05_test_det",
         "cancel_success_count_test_det",
         "cancel_needed_count_test_det",
     ]
@@ -511,8 +871,12 @@ def _write_hparam_latex_table(
     stage_name: str,
     trials: list[dict[str, Any]],
     best_trial_index: int | None,
+    selected_trial_indices: list[int] | None = None,
 ) -> None:
-    """Create LaTeX table with fixed/swept hyperparameters and best values."""
+    """Create LaTeX table with fixed/swept hyperparameters and best values.
+
+    The swept/fixed classification is inferred from the selected trial subset.
+    """
     stages = cfg.get("stages", {}) or {}
     stage_cfg = stages.get(stage_name, {}) if stage_name in stages else {}
     common_args = dict(cfg.get("common_args", {}) or {})
@@ -522,13 +886,39 @@ def _write_hparam_latex_table(
     base_args = {}
     base_args.update(common_args)
     base_args.update(stage_args)
-    swept_keys = set(grid.keys())
+    selected_indices = list(selected_trial_indices or [])
+    if not selected_indices:
+        selected_indices = list(range(len(trials)))
+
+    selected_trial_params: list[dict[str, Any]] = []
+    seen_indices: set[int] = set()
+    for idx_raw in selected_indices:
+        idx = int(idx_raw)
+        if idx in seen_indices:
+            continue
+        seen_indices.add(idx)
+        if 0 <= idx < len(trials):
+            selected_trial_params.append(dict(trials[idx]))
+    if not selected_trial_params and trials:
+        selected_trial_params = [dict(t) for t in trials]
+
+    selected_grid_values: dict[str, list[Any]] = {}
+    for key in grid.keys():
+        unique_values: dict[str, Any] = {}
+        for params in selected_trial_params:
+            if key not in params:
+                continue
+            val = params[key]
+            unique_values[_stringify(val)] = val
+        selected_grid_values[key] = list(unique_values.values())
+
+    swept_keys = {key for key, values in selected_grid_values.items() if len(values) > 1}
 
     best_trial_params: dict[str, Any] = {}
     if best_trial_index is not None and 0 <= best_trial_index < len(trials):
         best_trial_params = dict(trials[best_trial_index])
 
-    all_keys = sorted(set(base_args.keys()) | swept_keys | set(best_trial_params.keys()))
+    all_keys = sorted(set(base_args.keys()) | set(grid.keys()) | set(best_trial_params.keys()))
     lines = [
         r"\begin{table}[ht]",
         r"\centering",
@@ -538,10 +928,17 @@ def _write_hparam_latex_table(
         r"\hline",
     ]
     for key in all_keys:
+        selected_values = selected_grid_values.get(key, [])
         if key in swept_keys:
             kind = "swept"
-            range_or_value = _stringify(grid.get(key))
-            best_value = _stringify(best_trial_params.get(key, base_args.get(key, "")))
+            range_or_value = _stringify(selected_values)
+            fallback_best = selected_values[0] if selected_values else base_args.get(key, "")
+            best_value = _stringify(best_trial_params.get(key, fallback_best))
+        elif key in grid:
+            kind = "fixed"
+            fixed_val = selected_values[0] if selected_values else base_args.get(key, best_trial_params.get(key, ""))
+            range_or_value = _stringify(fixed_val)
+            best_value = _stringify(best_trial_params.get(key, fixed_val))
         else:
             kind = "fixed"
             fixed_val = base_args.get(key, best_trial_params.get(key, ""))
@@ -554,9 +951,16 @@ def _write_hparam_latex_table(
             f"{_latex_escape(best_value)} \\\\"
         )
         lines.append(r"\hline")
+    n_selected = len(selected_trial_params)
+    n_configured = len(trials)
+    caption_suffix = (
+        f" (selected trials={n_selected}/{n_configured})"
+        if n_configured > 0
+        else f" (selected trials={n_selected})"
+    )
     lines += [
         r"\end{tabular}",
-        rf"\caption{{PPO hyperparameters for stage {_latex_escape(stage_name)}}}",
+        rf"\caption{{PPO hyperparameters for stage {_latex_escape(stage_name)}{_latex_escape(caption_suffix)}}}",
         r"\end{table}",
         "",
     ]
@@ -638,7 +1042,7 @@ def _make_overview_plots(
     rows: list[dict[str, Any]],
     objective_mode: str,
 ) -> None:
-    """Write overview plots into summary/plots if matplotlib is available."""
+    """Write overview plots into summary/ if matplotlib is available."""
     try:
         import matplotlib
 
@@ -648,15 +1052,21 @@ def _make_overview_plots(
         return
 
     valid = [r for r in rows if r.get("objective") is not None]
-    if not valid:
+    objective_pairs: list[tuple[dict[str, Any], float]] = []
+    for row in valid:
+        try:
+            objective_pairs.append((row, float(row["objective"])))
+        except Exception:
+            continue
+    if not objective_pairs:
         return
+    valid_rows = [pair[0] for pair in objective_pairs]
 
-    plot_dir = summary_dir / "plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir = summary_dir
 
     # Plot 1: objective by trial index.
-    idx = [int(r["trial_index"]) for r in valid]
-    obj = [float(r["objective"]) for r in valid]
+    idx = [int(r["trial_index"]) for r in valid_rows]
+    obj = [pair[1] for pair in objective_pairs]
     plt.figure(figsize=(8, 4))
     plt.scatter(idx, obj, s=20)
     plt.xlabel("trial_index")
@@ -667,36 +1077,177 @@ def _make_overview_plots(
     plt.savefig(plot_dir / "objective_by_trial.png", dpi=140)
     plt.close()
 
-    # Plot 2: reward/accuracy/cancel-needed over trial index when available.
-    idx2 = []
-    reward = []
-    acc = []
-    bad_cancel = []
-    for r in valid:
-        rwd = r.get("reward_mean_test_det")
-        ac = r.get("accuracy_test_det")
-        bad = r.get("cancel_needed_count_test_det")
-        if rwd is None or ac is None or bad is None:
-            continue
-        idx2.append(int(r["trial_index"]))
-        reward.append(float(rwd))
-        acc.append(float(ac))
-        bad_cancel.append(float(bad))
-    if idx2:
+    if objective_mode == "min":
+        best_row, _best_objective = min(objective_pairs, key=lambda pair: pair[1])
+    else:
+        best_row, _best_objective = max(objective_pairs, key=lambda pair: pair[1])
+    best_trial_label = str(best_row.get("trial_number", best_row.get("trial_index", "?")))
+
+    def metric_or_nan(row: dict[str, Any], key: str) -> float:
+        raw = row.get(key)
+        if raw is None:
+            return float("nan")
+        try:
+            out = float(raw)
+        except Exception:
+            return float("nan")
+        return out if np.isfinite(out) else float("nan")
+
+    # Plot 1b: precision/recall/F_beta distributions across trials with best-trial markers.
+    precision_vals = [
+        metric_or_nan(row, "cancel_precision_test_det") for row in valid_rows
+    ]
+    precision_vals = [v for v in precision_vals if np.isfinite(v)]
+    recall_vals = [
+        metric_or_nan(row, "cancel_recall_test_det") for row in valid_rows
+    ]
+    recall_vals = [v for v in recall_vals if np.isfinite(v)]
+    fbeta_vals = [
+        metric_or_nan(row, "cancel_fbeta_beta05_test_det") for row in valid_rows
+    ]
+    fbeta_vals = [v for v in fbeta_vals if np.isfinite(v)]
+
+    best_precision = metric_or_nan(best_row, "cancel_precision_test_det")
+    best_recall = metric_or_nan(best_row, "cancel_recall_test_det")
+    best_fbeta = metric_or_nan(best_row, "cancel_fbeta_beta05_test_det")
+
+    if precision_vals or recall_vals or fbeta_vals:
+        n_bins_pr = min(
+            40,
+            max(
+                10,
+                int(
+                    np.sqrt(
+                        max(
+                            len(precision_vals),
+                            len(recall_vals),
+                            len(fbeta_vals),
+                            1,
+                        )
+                    )
+                ),
+            ),
+        )
+        fig_pr, axes_pr = plt.subplots(1, 3, figsize=(14, 4), sharey=True)
+
+        if precision_vals:
+            axes_pr[0].hist(precision_vals, bins=n_bins_pr, alpha=0.85, color="tab:blue")
+        if np.isfinite(best_precision):
+            axes_pr[0].axvline(
+                best_precision,
+                color="tab:red",
+                linestyle="--",
+                linewidth=1.4,
+                label=f"best trial={best_trial_label}",
+            )
+            axes_pr[0].legend(loc="upper left", fontsize=8, frameon=False)
+        axes_pr[0].set_xlabel("precision (PPV)")
+        axes_pr[0].set_ylabel("count")
+        axes_pr[0].set_title("Precision Distribution")
+        axes_pr[0].grid(alpha=0.2)
+
+        if recall_vals:
+            axes_pr[1].hist(recall_vals, bins=n_bins_pr, alpha=0.85, color="tab:orange")
+        if np.isfinite(best_recall):
+            axes_pr[1].axvline(
+                best_recall,
+                color="tab:red",
+                linestyle="--",
+                linewidth=1.4,
+                label=f"best trial={best_trial_label}",
+            )
+            axes_pr[1].legend(loc="upper left", fontsize=8, frameon=False)
+        axes_pr[1].set_xlabel("recall (TPR)")
+        axes_pr[1].set_title("Recall Distribution")
+        axes_pr[1].grid(alpha=0.2)
+
+        if fbeta_vals:
+            axes_pr[2].hist(fbeta_vals, bins=n_bins_pr, alpha=0.85, color="tab:green")
+        if np.isfinite(best_fbeta):
+            axes_pr[2].axvline(
+                best_fbeta,
+                color="tab:red",
+                linestyle="--",
+                linewidth=1.4,
+                label=f"best trial={best_trial_label}",
+            )
+            axes_pr[2].legend(loc="upper left", fontsize=8, frameon=False)
+        axes_pr[2].set_xlabel("F_beta (beta=0.5)")
+        axes_pr[2].set_title("F_beta Distribution")
+        axes_pr[2].grid(alpha=0.2)
+
+        fig_pr.tight_layout()
+        fig_pr.savefig(plot_dir / "precision_recall_histogram.png", dpi=140)
+        plt.close(fig_pr)
+
+    # Plot 2: reward/score/bad-cancel-ratio over trial index.
+    rows_by_trial = sorted(valid_rows, key=lambda row: int(row["trial_index"]))
+    idx2 = [int(row["trial_index"]) for row in rows_by_trial]
+    reward = np.asarray([metric_or_nan(row, "reward_mean_test_det") for row in rows_by_trial], dtype=np.float64)
+    acc = np.asarray([metric_or_nan(row, "accuracy_test_det") for row in rows_by_trial], dtype=np.float64)
+    precision = np.asarray([metric_or_nan(row, "cancel_precision_test_det") for row in rows_by_trial], dtype=np.float64)
+    recall = np.asarray([metric_or_nan(row, "cancel_recall_test_det") for row in rows_by_trial], dtype=np.float64)
+    cancel_success = np.asarray([metric_or_nan(row, "cancel_success_count_test_det") for row in rows_by_trial], dtype=np.float64)
+    cancel_bad = np.asarray([metric_or_nan(row, "cancel_needed_count_test_det") for row in rows_by_trial], dtype=np.float64)
+    cancel_total = cancel_success + cancel_bad
+    bad_cancel_ratio = np.full_like(cancel_bad, np.nan, dtype=np.float64)
+    np.divide(
+        cancel_bad,
+        cancel_total,
+        out=bad_cancel_ratio,
+        where=np.isfinite(cancel_bad) & np.isfinite(cancel_total) & (cancel_total > 0.0),
+    )
+
+    def _plot_series(ax: Any, x_vals: list[int], y_vals: np.ndarray, *, label: str, color: str) -> None:
+        mask = np.isfinite(y_vals)
+        if np.any(mask):
+            x_arr = np.asarray(x_vals, dtype=np.int32)
+            ax.plot(x_arr[mask], y_vals[mask], marker="o", linewidth=1.0, color=color, label=label)
+
+    def _positive_for_log(y_vals: np.ndarray) -> np.ndarray:
+        y = np.asarray(y_vals, dtype=np.float64).copy()
+        y[~np.isfinite(y)] = np.nan
+        y[y <= 0.0] = np.nan
+        return y
+
+    def _write_metrics_by_trial_plot(filename: str, *, log_scale: bool) -> None:
         fig, axes = plt.subplots(3, 1, figsize=(8, 8), sharex=True)
-        axes[0].plot(idx2, reward, marker="o", linewidth=1)
+        _plot_series(axes[0], idx2, reward, label="reward_mean", color="tab:blue")
         axes[0].set_ylabel("reward_mean")
         axes[0].grid(alpha=0.2)
-        axes[1].plot(idx2, acc, marker="o", linewidth=1, color="tab:green")
-        axes[1].set_ylabel("accuracy")
-        axes[1].grid(alpha=0.2)
-        axes[2].plot(idx2, bad_cancel, marker="o", linewidth=1, color="tab:red")
-        axes[2].set_ylabel("cancel_needed_count")
+
+        score_acc = _positive_for_log(acc) if log_scale else acc
+        score_precision = _positive_for_log(precision) if log_scale else precision
+        score_recall = _positive_for_log(recall) if log_scale else recall
+        _plot_series(axes[1], idx2, score_acc, label="accuracy", color="tab:green")
+        _plot_series(axes[1], idx2, score_precision, label="precision", color="tab:blue")
+        _plot_series(axes[1], idx2, score_recall, label="recall", color="tab:orange")
+        axes[1].set_ylabel("score")
+        if log_scale:
+            axes[1].set_yscale("log")
+            axes[1].set_ylim(1e-3, 1.0)
+        else:
+            axes[1].set_ylim(0.0, 1.0)
+        axes[1].grid(alpha=0.2, which="both")
+        axes[1].legend(loc="best", fontsize=8, frameon=False)
+
+        ratio_vals = _positive_for_log(bad_cancel_ratio) if log_scale else bad_cancel_ratio
+        _plot_series(axes[2], idx2, ratio_vals, label="bad_cancel_ratio", color="tab:red")
+        axes[2].set_ylabel("cancel_needed / cancelled")
+        if log_scale:
+            axes[2].set_yscale("log")
+            axes[2].set_ylim(1e-3, 1.0)
+        else:
+            axes[2].set_ylim(0.0, 1.0)
         axes[2].set_xlabel("trial_index")
-        axes[2].grid(alpha=0.2)
+        axes[2].grid(alpha=0.2, which="both")
         fig.tight_layout()
-        fig.savefig(plot_dir / "metrics_by_trial.png", dpi=140)
+        fig.savefig(plot_dir / filename, dpi=140)
         plt.close(fig)
+
+    if idx2:
+        _write_metrics_by_trial_plot("metrics_by_trial.png", log_scale=False)
+        _write_metrics_by_trial_plot("metrics_by_trial_log.png", log_scale=True)
 
 
 def _run_trial_command(
@@ -734,98 +1285,91 @@ def _run_trial_command(
         return int(proc.wait())
 
 
-def _copy_trial_plots_into_summary(
+def _copy_best_trial_bundle(
     summary_dir: Path,
     rows: list[dict[str, Any]],
     best_trial_index: int | None,
 ) -> dict[str, Any]:
-    """Copy per-trial run plots into summary folders instead of regenerating them."""
-    trial_plots_root = summary_dir / "trial_plots"
-    summary_plot_root = summary_dir / "plots"
-    trial_plots_root.mkdir(parents=True, exist_ok=True)
-    summary_plot_root.mkdir(parents=True, exist_ok=True)
-
-    copied_trials = 0
-    copied_files = 0
-    missing_plot_dirs: list[str] = []
-    copied_by_trial: list[dict[str, Any]] = []
-
-    for row in rows:
-        run_dir_raw = row.get("run_dir")
-        if not run_dir_raw:
-            continue
-        trial_idx = int(row.get("trial_index", -1))
-        tag = str(row.get("tag", "default"))
-        trial_key = f"trial_{trial_idx:03d}_{tag}"
-        src_plot_dir = Path(str(run_dir_raw)).expanduser() / "plots"
-        src_manifest = Path(str(run_dir_raw)).expanduser() / "plots_manifest.json"
-        dst_plot_dir = trial_plots_root / trial_key
-
-        copied_names: list[str] = []
-        if src_plot_dir.exists():
-            dst_plot_dir.mkdir(parents=True, exist_ok=True)
-            for src in sorted(src_plot_dir.glob("*.png")):
-                dst = dst_plot_dir / src.name
-                try:
-                    shutil.copy2(src, dst)
-                    copied_names.append(src.name)
-                except Exception:
-                    continue
-        else:
-            missing_plot_dirs.append(str(src_plot_dir))
-
-        if src_manifest.exists():
-            dst_plot_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy2(src_manifest, dst_plot_dir / "plots_manifest.json")
-            except Exception:
-                pass
-
-        if copied_names:
-            copied_trials += 1
-            copied_files += len(copied_names)
-            copied_by_trial.append(
-                {
-                    "trial_index": trial_idx,
-                    "tag": tag,
-                    "n_files": len(copied_names),
-                    "files": copied_names,
-                    "dest_dir": str(dst_plot_dir),
-                }
-            )
-
-    best_trial_plot_files: list[str] = []
-    if best_trial_index is not None:
-        best_row = next(
-            (
-                r
-                for r in rows
-                if int(r.get("trial_index", -1)) == int(best_trial_index)
-                and r.get("run_dir") is not None
-            ),
-            None,
-        )
-        if best_row is not None:
-            best_run_dir = Path(str(best_row["run_dir"])).expanduser()
-            best_plot_dir = best_run_dir / "plots"
-            if best_plot_dir.exists():
-                for src in sorted(best_plot_dir.glob("*.png")):
-                    dst_name = f"best_trial_{int(best_trial_index):03d}_{src.name}"
-                    dst = summary_plot_root / dst_name
-                    try:
-                        shutil.copy2(src, dst)
-                        best_trial_plot_files.append(str(dst))
-                    except Exception:
-                        continue
-
-    return {
-        "trial_plots_root": str(trial_plots_root),
-        "copied_trials": int(copied_trials),
-        "copied_files": int(copied_files),
-        "missing_plot_dirs": sorted(set(missing_plot_dirs)),
-        "copied_by_trial": copied_by_trial,
-        "best_trial_plot_files": best_trial_plot_files,
+    """Copy best-trial core artifacts and plots into summary/best_trial."""
+    best_root = summary_dir / "best_trial"
+    result: dict[str, Any] = {
+        "status": "missing_best_trial",
+        "best_trial_index": best_trial_index,
+        "best_root": str(best_root),
+        "source_run_dir": None,
+        "copied_files": [],
+        "copied_plots": [],
+        "manifest": str(best_root / "best_trial.json"),
     }
+    if best_trial_index is None:
+        return result
+
+    best_row = next(
+        (
+            r
+            for r in rows
+            if int(r.get("trial_index", -1)) == int(best_trial_index)
+            and r.get("run_dir") is not None
+        ),
+        None,
+    )
+    if best_row is None:
+        result["status"] = "missing_best_row"
+        return result
+
+    source_run_dir = Path(str(best_row["run_dir"])).expanduser()
+    result["source_run_dir"] = str(source_run_dir)
+    best_root.mkdir(parents=True, exist_ok=True)
+
+    copied_files: list[str] = []
+    copied_plots: list[str] = []
+    file_candidates = [
+        "final_metrics.json",
+        "run_config.json",
+        "training_status.json",
+        "history.json",
+        "plots_manifest.json",
+        "trial_config.json",
+        "trial.log",
+        "policy.weights.h5",
+        "value.weights.h5",
+    ]
+    for name in file_candidates:
+        src = source_run_dir / name
+        if not src.exists():
+            continue
+        dst = best_root / name
+        try:
+            shutil.copy2(src, dst)
+            copied_files.append(str(dst))
+        except Exception:
+            continue
+
+    src_plot_dir = source_run_dir / "plots"
+    dst_plot_dir = best_root / "plots"
+    if src_plot_dir.exists():
+        dst_plot_dir.mkdir(parents=True, exist_ok=True)
+        for src_plot in sorted(src_plot_dir.glob("*.png")):
+            dst_plot = dst_plot_dir / src_plot.name
+            try:
+                shutil.copy2(src_plot, dst_plot)
+                copied_plots.append(str(dst_plot))
+            except Exception:
+                continue
+
+    manifest_payload = {
+        "best_trial_number": int(best_row.get("trial_number", best_trial_index)),
+        "best_trial_index": int(best_trial_index),
+        "source_run_dir": str(source_run_dir),
+        "copied_files": copied_files,
+        "copied_plots": copied_plots,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _write_json(best_root / "best_trial.json", manifest_payload)
+    result["status"] = "ok"
+    result["copied_files"] = copied_files
+    result["copied_plots"] = copied_plots
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -848,7 +1392,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--data-dir",
         type=str,
         default=None,
-        help="Synthetic dataset directory. Relative paths resolve under run output root (default: data).",
+        help=(
+            "Synthetic dataset directory. Relative paths resolve under run output root. "
+            "Default: sibling '<run-name-without-_ppo>/data' when run name ends with '_ppo', "
+            "otherwise '<run-output>/data'."
+        ),
     )
     parser.add_argument(
         "--overwrite-data",
@@ -882,7 +1430,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--python-bin",
         type=str,
         default=None,
-        help="Python executable to run optimiser_ppo.py (default: config.python_bin or sys.executable)",
+        help="Python executable to run optimiser script (default: config.python_bin or sys.executable)",
+    )
+    parser.add_argument(
+        "--optimiser-script",
+        type=str,
+        default=None,
+        help="Path to optimiser script (default: rl/optimiser_ppo.py)",
     )
     parser.add_argument("--start-index", type=int, default=0, help="Start trial index (inclusive)")
     parser.add_argument("--max-trials", type=int, default=None, help="Max number of trials to run")
@@ -898,8 +1452,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--objective-key",
         type=str,
-        default="test_deterministic.reward_mean",
-        help="Nested key in final_metrics.json used for ranking",
+        default="test_deterministic.cancel_precision",
+        help="Nested key in final_metrics.json used for ranking (default: precision/PPV)",
     )
     parser.add_argument(
         "--objective-mode",
@@ -940,7 +1494,12 @@ def main() -> None:
     if args.max_trials is not None:
         indices = indices[: max(0, int(args.max_trials))]
 
-    script_path = Path(__file__).resolve().with_name("optimiser_ppo.py")
+    if args.optimiser_script is not None:
+        script_path = Path(args.optimiser_script).expanduser().resolve()
+    else:
+        script_path = Path(__file__).resolve().with_name("optimiser_ppo.py")
+    if not script_path.exists():
+        raise FileNotFoundError(f"Optimiser script not found: {script_path}")
     cfg_output_root = cfg.get("output_root")
     if args.output_root is not None:
         base_output_root = Path(args.output_root).expanduser().resolve()
@@ -952,11 +1511,8 @@ def main() -> None:
     else:
         base_output_root = (Path(__file__).resolve().parent / "outputs").resolve()
     output_root = base_output_root / (str(args.run_name) if args.run_name else stage_name)
-    trials_root = output_root / "trials"
-    logs_root = output_root / "logs"
     summary_dir = output_root / "summary"
-    trials_root.mkdir(parents=True, exist_ok=True)
-    logs_root.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
     summary_dir.mkdir(parents=True, exist_ok=True)
 
     python_bin = args.python_bin or cfg.get("python_bin") or sys.executable
@@ -969,6 +1525,7 @@ def main() -> None:
         f"n_trials_total={len(trials)} n_selected={len(indices)}"
     )
     print(f"[SWEEP] output_root={output_root}")
+    print(f"[SWEEP] optimiser_script={script_path}")
     print(f"[SWEEP] python={python_bin}")
     if passthrough_args:
         print(f"[SWEEP] forwarding_unknown_args_to_optimiser={passthrough_args}")
@@ -977,11 +1534,18 @@ def main() -> None:
     t0 = time.time()
     if args.dry_run:
         data_dir = _resolve_data_dir(output_root=output_root, data_dir_arg=args.data_dir)
+        data_root = data_dir.parent.resolve()
         data_info = {
+            "data_root": str(data_root),
             "data_dir": str(data_dir),
             "raw_path": str(data_dir / "df_raw.pkl"),
             "train_path": str(data_dir / "df_per_dest_train.pkl"),
             "test_path": str(data_dir / "df_per_dest_test.pkl"),
+            "plot_info": {
+                "status": "dry_run",
+                "plots_dir": str((data_root / "plots").resolve()),
+                "generated": [],
+            },
             "generated": False,
             "overwritten": False,
             "elapsed_s": 0.0,
@@ -997,6 +1561,7 @@ def main() -> None:
             },
         }
         print("[DATA] dry_run enabled: skipping dataset generation/reuse checks.")
+        print(f"[DATA] expected_data_root={data_info['data_root']}")
         print(f"[DATA] expected_train_path={data_info['train_path']}")
         print(f"[DATA] expected_test_path={data_info['test_path']}")
     else:
@@ -1015,11 +1580,13 @@ def main() -> None:
         )
 
     for rank_in_order, trial_idx in enumerate(indices, start=1):
+        trial_number = int(trial_idx)
         trial_cfg = trials[trial_idx]
         tag = _make_trial_tag(trial_cfg, tag_keys)
-        run_dir = trials_root / f"trial_{trial_idx:03d}_{tag}"
+        run_dir = output_root / f"trial_{trial_number:03d}"
         metrics_path = run_dir / "final_metrics.json"
-        log_path = logs_root / f"trial_{trial_idx:03d}_{tag}.log"
+        log_path = run_dir / "trial.log"
+        trial_config_path = run_dir / "trial_config.json"
 
         cmd = [
             str(python_bin),
@@ -1040,6 +1607,7 @@ def main() -> None:
 
         record: dict[str, Any] = {
             "rank": None,
+            "trial_number": trial_number,
             "trial_index": trial_idx,
             "tag": tag,
             "status": "pending",
@@ -1052,6 +1620,24 @@ def main() -> None:
             "command": cmd,
         }
 
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(
+            trial_config_path,
+            {
+                "trial_number": int(trial_number),
+                "trial_index": int(trial_idx),
+                "stage": str(stage_name),
+                "tag": str(tag),
+                "trial_params": dict(trial_cfg),
+                "run_dir": str(run_dir),
+                "log_path": str(log_path),
+                "train_path": str(data_info["train_path"]),
+                "test_path": str(data_info["test_path"]),
+                "command": cmd,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+
         if args.skip_existing and metrics_path.exists():
             record["status"] = "skipped_existing"
             metrics = _load_json(metrics_path)
@@ -1062,20 +1648,32 @@ def main() -> None:
                     record["reward_mean_test_det"] = test_det.get("reward_mean")
                     record["accuracy_test_det"] = test_det.get("decision_accuracy")
                     record["cancel_rate_test_det"] = test_det.get("cancel_rate")
+                    record["cancel_precision_test_det"] = test_det.get("cancel_precision")
+                    record["cancel_recall_test_det"] = test_det.get("cancel_recall")
+                    record["cancel_f1_test_det"] = test_det.get("cancel_f1")
+                    record["cancel_fbeta_beta05_test_det"] = test_det.get(
+                        "cancel_fbeta_beta05",
+                        test_det.get("cancel_fbeta"),
+                    )
                     record["cancel_success_count_test_det"] = test_det.get("cancel_success_count")
                     record["cancel_needed_count_test_det"] = test_det.get("cancel_needed_count")
             rows.append(record)
-            print(f"[SWEEP] [{rank_in_order}/{len(indices)}] skip trial={trial_idx} ({tag})")
+            print(
+                f"[SWEEP] [{rank_in_order}/{len(indices)}] "
+                f"skip trial_number={trial_number} trial_index={trial_idx} ({tag})"
+            )
             continue
 
-        print(f"[SWEEP] [{rank_in_order}/{len(indices)}] run trial={trial_idx} ({tag})")
+        print(
+            f"[SWEEP] [{rank_in_order}/{len(indices)}] "
+            f"run trial_number={trial_number} trial_index={trial_idx} ({tag})"
+        )
         print(f"[SWEEP] cmd: {' '.join(shlex.quote(x) for x in cmd)}")
         if args.dry_run:
             record["status"] = "dry_run"
             rows.append(record)
             continue
 
-        run_dir.mkdir(parents=True, exist_ok=True)
         t_start = time.time()
         return_code = _run_trial_command(
             cmd=cmd,
@@ -1096,12 +1694,20 @@ def main() -> None:
                 record["reward_mean_test_det"] = test_det.get("reward_mean")
                 record["accuracy_test_det"] = test_det.get("decision_accuracy")
                 record["cancel_rate_test_det"] = test_det.get("cancel_rate")
+                record["cancel_precision_test_det"] = test_det.get("cancel_precision")
+                record["cancel_recall_test_det"] = test_det.get("cancel_recall")
+                record["cancel_f1_test_det"] = test_det.get("cancel_f1")
+                record["cancel_fbeta_beta05_test_det"] = test_det.get(
+                    "cancel_fbeta_beta05",
+                    test_det.get("cancel_fbeta"),
+                )
                 record["cancel_success_count_test_det"] = test_det.get("cancel_success_count")
                 record["cancel_needed_count_test_det"] = test_det.get("cancel_needed_count")
 
         rows.append(record)
         print(
-            f"[SWEEP] trial={trial_idx} status={record['status']} "
+            f"[SWEEP] trial_number={trial_number} trial_index={trial_idx} "
+            f"status={record['status']} "
             f"objective={record['objective']} "
             f"runtime={_format_minutes_seconds(runtime_s)} ({runtime_s:.1f}s)"
         )
@@ -1115,6 +1721,7 @@ def main() -> None:
 
     elapsed_total = time.time() - t0
     best_trial_index = int(valid_rows_sorted[0]["trial_index"]) if valid_rows_sorted else None
+    best_trial_number = int(valid_rows_sorted[0]["trial_number"]) if valid_rows_sorted else None
     summary = {
         "config": str(config_path),
         "stage": stage_name,
@@ -1125,11 +1732,14 @@ def main() -> None:
         "elapsed_s": float(elapsed_total),
         "elapsed_human": _format_minutes_seconds(elapsed_total),
         "output_root": str(output_root),
+        "optimiser_script": str(script_path),
         "dataset": {
+            "data_root": str(data_info["data_root"]),
             "data_dir": str(data_info["data_dir"]),
             "raw_path": str(data_info["raw_path"]),
             "train_path": str(data_info["train_path"]),
             "test_path": str(data_info["test_path"]),
+            "plot_info": data_info.get("plot_info"),
             "generated": bool(data_info["generated"]),
             "overwritten": bool(data_info["overwritten"]),
             "elapsed_s": float(data_info["elapsed_s"]),
@@ -1145,9 +1755,10 @@ def main() -> None:
             "sim_n_parcels_per_truck": int(args.sim_n_parcels_per_truck),
             "day_summary": data_info.get("day_summary"),
         },
-        "trials_dir": str(trials_root),
-        "logs_dir": str(logs_root),
+        "trials_dir": str(output_root),
+        "logs_embedded_in_trial_dirs": True,
         "summary_dir": str(summary_dir),
+        "best_trial_number": best_trial_number,
         "best_trial_index": best_trial_index,
         "best_objective": (float(valid_rows_sorted[0]["objective"]) if valid_rows_sorted else None),
         "rows": rows,
@@ -1160,17 +1771,18 @@ def main() -> None:
         stage_name=stage_name,
         trials=trials,
         best_trial_index=best_trial_index,
+        selected_trial_indices=[int(r["trial_index"]) for r in rows if r.get("trial_index") is not None],
     )
     latex_pdf = _compile_hparam_latex_pdf(summary_dir=summary_dir, table_filename="hyperparams_table.tex")
     summary["latex_pdf"] = latex_pdf
-    copied_trial_plots = _copy_trial_plots_into_summary(
+    best_trial_bundle = _copy_best_trial_bundle(
         summary_dir=summary_dir,
         rows=rows,
         best_trial_index=best_trial_index,
     )
-    summary["copied_trial_plots"] = copied_trial_plots
-    _write_json(summary_dir / "summary.json", summary)
+    summary["best_trial_bundle"] = best_trial_bundle
     _make_overview_plots(summary_dir=summary_dir, rows=rows, objective_mode=args.objective_mode)
+    _write_json(summary_dir / "summary.json", summary)
 
     print(f"[SWEEP] Wrote summary: {summary_dir / 'summary.json'}")
     print(f"[SWEEP] Wrote summary: {summary_dir / 'summary.csv'}")
@@ -1184,18 +1796,22 @@ def main() -> None:
             "[SWEEP] Failed to compile LaTeX PDF; "
             f"see {summary_dir / 'hyperparams_table_pdflatex.log'}"
         )
-    print(
-        "[SWEEP] Copied trial plots: "
-        f"n_trials={copied_trial_plots.get('copied_trials', 0)} "
-        f"n_files={copied_trial_plots.get('copied_files', 0)} "
-        f"into {summary_dir / 'trial_plots'}"
-    )
-    print(f"[SWEEP] Wrote plots in: {summary_dir / 'plots'}")
-    print(f"[SWEEP] Total runtime: {_format_minutes_seconds(elapsed_total)} ({elapsed_total:.1f}s)")
+    if best_trial_bundle.get("status") == "ok":
+        print(
+            "[SWEEP] Copied best-trial bundle: "
+            f"n_files={len(best_trial_bundle.get('copied_files', []))} "
+            f"n_plots={len(best_trial_bundle.get('copied_plots', []))} "
+            f"into {summary_dir / 'best_trial'}"
+        )
+    else:
+        print("[SWEEP] Best-trial bundle unavailable (no successful ranked trial found).")
+    print(f"[SWEEP] Wrote overview plots in: {summary_dir}")
+    print(f"[SWEEP] Total runtime: {_format_hours_minutes_seconds(elapsed_total)} ({elapsed_total:.1f}s)")
     if valid_rows_sorted:
         best = valid_rows_sorted[0]
         print(
-            f"[SWEEP] Best trial={best['trial_index']} rank=1 "
+            f"[SWEEP] Best trial_number={best.get('trial_number')} "
+            f"trial_index={best['trial_index']} rank=1 "
             f"objective={best['objective']} run_dir={best['run_dir']}"
         )
 

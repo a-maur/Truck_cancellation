@@ -47,22 +47,23 @@ bash run_ppo.sh
 The wrapper already contains defaults for:
 
 ```bash
-PYTHON_BIN, CONFIG_PATH, OUTPUT_ROOT, STAGE, TRIAL_INDEX, RUN_NAME, WITH_SUMMARY, SKIP_EXISTING, STREAM_TRIAL_LOGS
+PYTHON_BIN, CONFIG_PATH, OUTPUT_ROOT, RUN_NAME, STAGE, TRIAL_INDEX, MAX_TRIALS, SHUFFLE_TRIALS, SHUFFLE_SEED, SKIP_EXISTING, STREAM_TRIAL_LOGS, OVERWRITE_DATA
 ```
 
 By default `PYTHON_BIN=python`, so it uses your active conda environment.
 
 Edit these at the top of `run_ppo.sh` if needed.
 
-`run_ppo.sh` defaults to `WITH_SUMMARY=1`, which routes the run through `run_ppo_sweep.py` with `--max-trials 1` (and `--start-index` from `TRIAL_INDEX`). This means you get a `summary/` folder even when running a single trial. Set `WITH_SUMMARY=0` to run `optimiser_ppo.py` directly.
+`run_ppo.sh` runs `run_ppo_sweep.py` by default and also defaults to:
 
-`run_ppo.sh` also defaults to `STREAM_TRIAL_LOGS=1`, so optimiser progress lines (for example `update=10/300`) are printed live even in summary/sweep mode.
+- `STREAM_TRIAL_LOGS=1` (print optimiser progress live)
+- `SHUFFLE_TRIALS=0` (keeps trial folder numbering ordered)
 
-You can override wrapper defaults at launch without editing the script. Example direct single trial (no sweep wrapper):
+You can override wrapper defaults at launch without editing the script. Example:
 
 ```bash
 cd Truck_cancellation/rl
-WITH_SUMMARY=0 bash run_ppo.sh
+MAX_TRIALS=1 RUN_NAME=initial_tests_ppo bash run_ppo.sh
 ```
 
 Useful options:
@@ -111,8 +112,9 @@ Outputs are saved under `/disk/lhcb_data/maander/output_truck_cancellation/ppo_<
   - `hourly_volume_profile.png` (example route-day cumulative volume + agent decisions by hour + final optimal decision)
   - `hourly_decision_rates_test.png` (test cancel rate and cancel success rate by hour)
   - `cancel_metrics_by_destination_test.png`
+  - `hourly_correctly_cancelled_grid_test.png` (all center->destination routes; hourly fraction `correct_cancels / cancellations`)
 
-When `WITH_SUMMARY=1` in `run_ppo.sh`, outputs follow the sweep layout under `/disk/lhcb_data/maander/output_truck_cancellation/<run-name>/` with `trials/`, `logs/`, and `summary/`.
+Sweep outputs are written under `/disk/lhcb_data/maander/output_truck_cancellation/<run-name>/` (or `rl/outputs/<run-name>/` when using local defaults).
 
 To save in your shared output location with a named folder:
 
@@ -165,23 +167,31 @@ To stream optimiser logs during sweep execution, add:
 
 The sweep runner writes the following structure under `/disk/lhcb_data/maander/output_truck_cancellation/<run-name>/`:
 
-- `trials/`: trial folders (`trial_XXX_*`) with each trial's PPO artifacts
-  - each trial folder also contains `plots/` + `plots_manifest.json` from `optimiser_ppo.py`
-- `logs/`: one log file per trial
+- `trial_000/`, `trial_001/`, ...:
+  - each trial folder contains PPO artifacts from `optimiser_ppo.py`
+  - each trial folder also contains:
+    - `trial.log` (stdout/stderr for that trial)
+    - `trial_config.json` (resolved trial params + command)
+    - `plots/` + `plots_manifest.json`
 - `summary/`:
   - `summary.json`
   - `summary.csv`
   - `hyperparams_table.tex` (fixed + swept ranges + best values)
   - `hyperparams_table.pdf` (auto-generated when `pdflatex` is installed)
   - `hyperparams_table_pdflatex.log` (compile log when PDF generation is attempted)
-  - `trial_plots/`: copied per-trial plot folders (`trial_XXX_*/`)
-  - `plots/objective_by_trial.png`
-  - `plots/metrics_by_trial.png`
-  - `plots/best_trial_XXX_*.png` (copied best-trial generation plots)
+  - `best_trial/`: copied best-trial metrics/config/log/weights/plots
+  - `objective_by_trial.png`
+  - `precision_recall_histogram.png`
+  - `metrics_by_trial.png`
+
+Shared synthetic data is stored once per run family:
+
+- If run name ends with `_ppo` (for example `initial_tests_ppo`), default data path is sibling `rl/outputs/initial_tests/data`
+- Dataset overview plots are written to `rl/outputs/initial_tests/plots`
 
 Ranking defaults to maximizing:
 
-- `test_deterministic.reward_mean`
+- `test_deterministic.cancel_precision`
 
 and can be changed with:
 

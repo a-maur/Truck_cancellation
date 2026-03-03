@@ -146,6 +146,8 @@ class DataBundle:
     dest_vocab: list[str] = field(default_factory=list)
     train_df: pd.DataFrame | None = None
     test_df: pd.DataFrame | None = None
+    train_episode_ids: np.ndarray | None = None
+    test_episode_ids: np.ndarray | None = None
 
     @property
     def state_dim(self) -> int:
@@ -169,6 +171,20 @@ class RolloutBatch:
     @property
     def size(self) -> int:
         return int(self.states.shape[0])
+
+
+@dataclass
+class ReplaySample:
+    """Replay minibatch with optional PER metadata."""
+
+    obs: np.ndarray
+    actions: np.ndarray
+    rewards: np.ndarray
+    next_obs: np.ndarray
+    dones: np.ndarray
+    discounts: np.ndarray
+    is_weights: np.ndarray
+    indices: np.ndarray | None = None
 
 
 def seed_everything(seed: int | None) -> np.random.Generator:
@@ -330,6 +346,56 @@ def derive_needed_label(df: pd.DataFrame, cfg: LabelConfig) -> tuple[np.ndarray,
     return y, fill_ratio
 
 
+def derive_episode_ids(df: pd.DataFrame | None) -> np.ndarray | None:
+    """Build per-row episode identifiers for trajectory-style training.
+
+    Preferred source columns (if present): `sample_id`, `episode_id`, `day_id`.
+    Fallback (for existing macro datasets): align rows across hours using
+    row-order rank within each (center, dest, hour) group.
+    """
+    if df is None or len(df) == 0:
+        return None
+
+    for col in ("sample_id", "episode_id", "day_id"):
+        if col in df.columns:
+            base = df[col].astype(str).to_numpy()
+            if "center" in df.columns and "dest" in df.columns:
+                keys = (
+                    df["center"].astype(str).to_numpy()
+                    + "|"
+                    + df["dest"].astype(str).to_numpy()
+                    + "|"
+                    + base
+                )
+            else:
+                keys = base
+            codes, _uniques = pd.factorize(keys, sort=False)
+            return np.asarray(codes, dtype=np.int32)
+
+    required = {"center", "dest", "hour"}
+    if required.issubset(set(df.columns)):
+        temp = pd.DataFrame(
+            {
+                "center": df["center"].astype(str).to_numpy(),
+                "dest": df["dest"].astype(str).to_numpy(),
+                "hour": df["hour"].to_numpy(dtype=np.int32),
+            }
+        )
+        temp["_seq"] = temp.groupby(["center", "dest", "hour"], sort=False).cumcount()
+        keys = (
+            temp["center"].to_numpy()
+            + "|"
+            + temp["dest"].to_numpy()
+            + "|"
+            + temp["_seq"].astype(str).to_numpy()
+        )
+        codes, _uniques = pd.factorize(keys, sort=False)
+        return np.asarray(codes, dtype=np.int32)
+
+    # Last-resort fallback: each row is its own "episode".
+    return np.arange(len(df), dtype=np.int32)
+
+
 def load_data_bundle(
     train_path: str | Path,
     test_path: str | Path,
@@ -345,6 +411,8 @@ def load_data_bundle(
     x_train, x_test, feature_names, norm, center_vocab, dest_vocab = build_state_matrices(train_df, test_df, cfg)
     y_train, fill_ratio_train = derive_needed_label(train_df, lcfg)
     y_test, fill_ratio_test = derive_needed_label(test_df, lcfg)
+    train_episode_ids = derive_episode_ids(train_df)
+    test_episode_ids = derive_episode_ids(test_df)
     train_hours = (
         train_df["hour"].to_numpy(dtype=np.float32)
         if "hour" in train_df.columns
@@ -356,7 +424,7 @@ def load_data_bundle(
         else np.zeros((x_test.shape[0],), dtype=np.float32)
     )
     max_hour = int(max(np.max(train_hours), np.max(test_hours), 1.0))
-    min_hour = int(min(np.min(train_hours), np.min(test_hours), 0.0))
+    min_hour = int(min(np.min(train_hours), np.min(test_hours)))
 
     return DataBundle(
         x_train=x_train,
@@ -377,6 +445,8 @@ def load_data_bundle(
         dest_vocab=dest_vocab,
         train_df=train_df,
         test_df=test_df,
+        train_episode_ids=train_episode_ids,
+        test_episode_ids=test_episode_ids,
     )
 
 
@@ -506,6 +576,21 @@ def compute_decision_metrics(actions: np.ndarray, labels_needed: np.ndarray, rew
 
     cancel_precision = cancel_not_needed / max(1, cancel_not_needed + cancel_needed)
     cancel_recall = cancel_not_needed / max(1, cancel_not_needed + keep_not_needed)
+    f1_denom = cancel_precision + cancel_recall
+    cancel_f1 = (
+        (2.0 * cancel_precision * cancel_recall / f1_denom)
+        if f1_denom > 0.0
+        else 0.0
+    )
+
+    beta = 0.5
+    beta_sq = beta * beta
+    f_beta_denom = beta_sq * cancel_precision + cancel_recall
+    cancel_fbeta_beta05 = (
+        ((1.0 + beta_sq) * cancel_precision * cancel_recall / f_beta_denom)
+        if f_beta_denom > 0.0
+        else 0.0
+    )
 
     return {
         "n": float(n),
@@ -523,6 +608,10 @@ def compute_decision_metrics(actions: np.ndarray, labels_needed: np.ndarray, rew
         "keep_not_needed_rate": float(keep_not_needed / n),
         "cancel_precision": float(cancel_precision),
         "cancel_recall": float(cancel_recall),
+        "cancel_f1": float(cancel_f1),
+        "cancel_fbeta": float(cancel_fbeta_beta05),
+        "cancel_fbeta_beta05": float(cancel_fbeta_beta05),
+        "cancel_fbeta_beta1": float(cancel_f1),
         "cancel_success_rate_among_cancellations": float(cancel_precision),
         "cancel_needed_rate_among_cancellations": float(1.0 - cancel_precision),
     }
@@ -590,8 +679,14 @@ class ValueNetwork(Model):
 class NoisyDense(layers.Layer):
     """Factorized NoisyNet layer (for future Rainbow-like value optimisers)."""
 
-    def __init__(self, units: int, sigma0: float = 0.5, activation: str | None = None):
-        super().__init__()
+    def __init__(
+        self,
+        units: int,
+        sigma0: float = 0.5,
+        activation: str | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
         self.units = int(units)
         self.sigma0 = float(sigma0)
         self.activation = tf.keras.activations.get(activation)
@@ -683,6 +778,172 @@ class DuelingQNetwork(Model):
             a = a - tf.reduce_mean(a, axis=1, keepdims=True)
             return v + a
         return self.q_head(z, training=training)
+
+
+def make_dense_layer(
+    units: int,
+    activation: str | None = "relu",
+    noisy: bool = False,
+    name: str | None = None,
+):
+    """Build a Dense/NoisyDense layer with a common signature."""
+    if noisy:
+        return NoisyDense(int(units), activation=activation, name=name)
+    return layers.Dense(int(units), activation=activation, name=name)
+
+
+def huber_loss(errors: tf.Tensor, kappa: float = 1.0) -> tf.Tensor:
+    """Huber loss on arbitrary-shaped tensors."""
+    err = tf.convert_to_tensor(errors, dtype=tf.float32)
+    k = float(kappa)
+    if k <= 0.0:
+        return tf.abs(err)
+    abs_err = tf.abs(err)
+    return tf.where(abs_err <= k, 0.5 * tf.square(err), k * (abs_err - 0.5 * k))
+
+
+def quantile_huber_loss_per_sample(
+    td_errors: tf.Tensor,
+    taus: tf.Tensor,
+    kappa: float = 1.0,
+) -> tf.Tensor:
+    """Quantile Huber loss per sample for QR/IQN-style critics.
+
+    Args:
+        td_errors: Tensor shaped [B, N, N_tgt] where N=current quantiles.
+        taus: Tensor shaped [B, N] or [N] corresponding to current quantiles.
+        kappa: Huber threshold.
+    """
+    td = tf.convert_to_tensor(td_errors, dtype=tf.float32)
+    tau = tf.convert_to_tensor(taus, dtype=tf.float32)
+    if tau.shape.rank == 1:
+        batch_size = tf.shape(td)[0]
+        tau = tf.broadcast_to(tau[None, :], (batch_size, tf.shape(tau)[0]))
+    if tau.shape.rank != 2:
+        raise ValueError(f"taus must be rank-1 or rank-2, got shape {tau.shape}")
+
+    indicator = tf.cast(td < 0.0, tf.float32)
+    tau_expand = tau[:, :, None]
+    quantile_weights = tf.abs(tau_expand - indicator)
+    loss = quantile_weights * huber_loss(td, kappa=kappa)
+    return tf.reduce_mean(loss, axis=[1, 2])
+
+
+def reduce_per_sample_loss(loss_per_sample: tf.Tensor, is_weights: tf.Tensor | None = None) -> tf.Tensor:
+    """Reduce per-sample losses with optional normalized importance weights."""
+    per_sample = tf.convert_to_tensor(loss_per_sample, dtype=tf.float32)
+    if is_weights is None:
+        return tf.reduce_mean(per_sample)
+    weights = tf.convert_to_tensor(is_weights, dtype=tf.float32)
+    weights = weights / (tf.reduce_max(weights) + 1e-8)
+    return tf.reduce_mean(per_sample * weights)
+
+
+def soft_update_model(source: Model, target: Model, tau: float = 0.005) -> None:
+    """Polyak averaging update: target <- tau*source + (1-tau)*target."""
+    t = float(np.clip(float(tau), 0.0, 1.0))
+    if t >= 1.0:
+        target.set_weights(source.get_weights())
+        return
+    for src_var, tgt_var in zip(source.trainable_variables, target.trainable_variables):
+        tgt_var.assign(t * src_var + (1.0 - t) * tgt_var)
+
+
+def hard_update_model(source: Model, target: Model) -> None:
+    """Copy model weights from source into target."""
+    target.set_weights(source.get_weights())
+
+
+class IQNQNetwork(Model):
+    """Implicit Quantile Network for discrete actions.
+
+    Output shape is [B, A, N] where:
+    - B: batch size
+    - A: number of discrete actions
+    - N: number of sampled quantiles
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_actions: int,
+        hidden_sizes: Sequence[int] = (128, 128),
+        n_cos: int = 64,
+        dueling: bool = True,
+        noisy: bool = False,
+        activation: str = "relu",
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.num_actions = int(num_actions)
+        self.n_cos = int(max(1, n_cos))
+        self.dueling = bool(dueling)
+        self.noisy = bool(noisy)
+
+        hidden = tuple(int(h) for h in hidden_sizes) if hidden_sizes else (128, 128)
+        self.embed_dim = int(hidden[-1])
+        self.state_hidden = [
+            make_dense_layer(h, activation=activation, noisy=self.noisy, name=f"iqn_state_{i}")
+            for i, h in enumerate(hidden)
+        ]
+        self.tau_fc = make_dense_layer(
+            self.embed_dim,
+            activation=activation,
+            noisy=self.noisy,
+            name="iqn_tau_fc",
+        )
+        if self.dueling:
+            self.adv_head = make_dense_layer(
+                self.num_actions,
+                activation=None,
+                noisy=self.noisy,
+                name="iqn_adv_head",
+            )
+            self.val_head = make_dense_layer(
+                1,
+                activation=None,
+                noisy=self.noisy,
+                name="iqn_val_head",
+            )
+            self.out_head = None
+        else:
+            self.out_head = make_dense_layer(
+                self.num_actions,
+                activation=None,
+                noisy=self.noisy,
+                name="iqn_q_head",
+            )
+            self.adv_head = None
+            self.val_head = None
+
+        self._pi = tf.constant(np.pi, dtype=tf.float32)
+        self._cos_idx = tf.range(1, self.n_cos + 1, dtype=tf.float32)[None, None, :]
+
+    def call(self, x: tf.Tensor, taus: tf.Tensor, training: bool = False) -> tf.Tensor:
+        obs = tf.convert_to_tensor(x, tf.float32)
+        tau = tf.convert_to_tensor(taus, tf.float32)
+        if tau.shape.rank == 1:
+            batch_size = tf.shape(obs)[0]
+            tau = tf.broadcast_to(tau[None, :], (batch_size, tf.shape(tau)[0]))
+        elif tau.shape.rank != 2:
+            raise ValueError(f"taus must be rank-1 or rank-2, got shape {tau.shape}")
+
+        z = obs
+        for layer in self.state_hidden:
+            z = layer(z, training=training)
+
+        tau_expand = tau[:, :, None]
+        cos_embed = tf.cos(self._pi * tau_expand * self._cos_idx)
+        tau_embed = self.tau_fc(cos_embed, training=training)
+        h = tau_embed * z[:, None, :]
+
+        if self.dueling:
+            adv = self.adv_head(h, training=training)
+            val = self.val_head(h, training=training)
+            q = val + (adv - tf.reduce_mean(adv, axis=-1, keepdims=True))
+        else:
+            q = self.out_head(h, training=training)
+        return tf.transpose(q, perm=[0, 2, 1])
 
 
 class ReplayBuffer:
@@ -806,6 +1067,60 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             self.max_priority = max(self.max_priority, float(np.max(p)))
 
 
+def build_replay_buffer(
+    obs_dim: int,
+    capacity: int,
+    use_per: bool = False,
+    per_alpha: float = 0.6,
+    per_eps: float = 1e-6,
+) -> ReplayBuffer | PrioritizedReplayBuffer:
+    """Factory for uniform/PER replay buffers."""
+    if bool(use_per):
+        return PrioritizedReplayBuffer(
+            capacity=int(capacity),
+            obs_dim=int(obs_dim),
+            alpha=float(per_alpha),
+            eps=float(per_eps),
+        )
+    return ReplayBuffer(capacity=int(capacity), obs_dim=int(obs_dim))
+
+
+def sample_replay_batch(
+    replay: ReplayBuffer | PrioritizedReplayBuffer,
+    batch_size: int,
+    per_beta: float = 0.4,
+) -> ReplaySample:
+    """Sample a replay minibatch with unified output for uniform/PER replay."""
+    if isinstance(replay, PrioritizedReplayBuffer):
+        obs, actions, rewards, next_obs, dones, discounts, is_weights, indices = replay.sample(
+            int(batch_size),
+            beta=float(per_beta),
+        )
+        return ReplaySample(
+            obs=obs,
+            actions=actions,
+            rewards=rewards,
+            next_obs=next_obs,
+            dones=dones,
+            discounts=discounts,
+            is_weights=is_weights,
+            indices=np.asarray(indices, dtype=np.int32),
+        )
+
+    obs, actions, rewards, next_obs, dones, discounts = replay.sample(int(batch_size))
+    b = int(obs.shape[0])
+    return ReplaySample(
+        obs=obs,
+        actions=actions,
+        rewards=rewards,
+        next_obs=next_obs,
+        dones=dones,
+        discounts=discounts,
+        is_weights=np.ones((b,), dtype=np.float32),
+        indices=None,
+    )
+
+
 class OneStepCancellationEnv:
     """Offline one-step environment built from pre-generated simulation rows."""
 
@@ -859,7 +1174,7 @@ class OneStepCancellationEnv:
     def collect_rollout(
         self,
         policy: BinaryPolicyNetwork,
-        value_fn: ValueNetwork,
+        value_fn: ValueNetwork | None,
         batch_size: int,
     ) -> RolloutBatch:
         idx = self.sample_indices(batch_size)
@@ -869,7 +1184,10 @@ class OneStepCancellationEnv:
 
         s_tf = tf.convert_to_tensor(s, dtype=tf.float32)
         logits = tf.squeeze(policy(s_tf, training=False), axis=-1).numpy().astype(np.float32)
-        values = tf.squeeze(value_fn(s_tf, training=False), axis=-1).numpy().astype(np.float32)
+        if value_fn is None:
+            values = np.zeros((s.shape[0],), dtype=np.float32)
+        else:
+            values = tf.squeeze(value_fn(s_tf, training=False), axis=-1).numpy().astype(np.float32)
         probs = sigmoid_np(logits)
         actions = self.rng.binomial(1, probs).astype(np.float32)
 
@@ -894,6 +1212,192 @@ class OneStepCancellationEnv:
             values=values,
             returns=returns,
             advantages=advantages,
+        )
+
+
+class TrajectoryCancellationEnv:
+    """Episode-style offline env with irreversible cancellation decisions.
+
+    Each episode corresponds to a route-day sequence ordered by hour.
+    Once action=1 (cancel) is taken, the episode terminates.
+    """
+
+    def __init__(
+        self,
+        states: np.ndarray,
+        labels_needed: np.ndarray,
+        episode_ids: np.ndarray,
+        reward_config: RewardConfig,
+        hours: np.ndarray | None = None,
+        min_hour: int | None = None,
+        max_hour: int | None = None,
+        gamma: float = 1.0,
+        rng: np.random.Generator | None = None,
+    ):
+        self.states = np.asarray(states, dtype=np.float32)
+        self.labels = np.asarray(labels_needed, dtype=np.float32)
+        self.episode_ids = np.asarray(episode_ids, dtype=np.int64)
+        self.reward_config = reward_config
+        self.hours = (
+            np.asarray(hours, dtype=np.float32)
+            if hours is not None
+            else np.zeros((self.states.shape[0],), dtype=np.float32)
+        )
+        self.gamma = float(max(0.0, gamma))
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+        if self.states.ndim != 2:
+            raise ValueError(f"states must be 2D, got shape {self.states.shape}")
+        if self.labels.ndim != 1:
+            raise ValueError(f"labels_needed must be 1D, got shape {self.labels.shape}")
+        if self.episode_ids.ndim != 1:
+            raise ValueError(f"episode_ids must be 1D, got shape {self.episode_ids.shape}")
+        n = self.states.shape[0]
+        if self.labels.shape[0] != n or self.hours.shape[0] != n or self.episode_ids.shape[0] != n:
+            raise ValueError("states/labels/hours/episode_ids length mismatch")
+
+        if min_hour is not None:
+            self.min_hour = int(min_hour)
+        else:
+            self.min_hour = int(np.min(self.hours))
+        if max_hour is not None:
+            self.max_hour = int(max(max_hour, 1))
+        else:
+            self.max_hour = int(max(1, np.max(self.hours)))
+
+        order = np.lexsort((self.hours.astype(np.float32), self.episode_ids.astype(np.int64)))
+        ep_sorted = self.episode_ids[order]
+        split_points = np.flatnonzero(np.diff(ep_sorted)) + 1
+        episode_rows = np.split(order, split_points)
+        self.episodes: list[np.ndarray] = [rows.astype(np.int32) for rows in episode_rows if rows.size > 0]
+        if not self.episodes:
+            raise ValueError("No episodes could be constructed from episode_ids.")
+
+    @property
+    def n_episodes(self) -> int:
+        return len(self.episodes)
+
+    def sample_episode_indices(self, n_episodes: int) -> np.ndarray:
+        n = int(max(1, n_episodes))
+        replace = self.n_episodes < n
+        return self.rng.choice(self.n_episodes, size=n, replace=replace).astype(np.int32)
+
+    def collect_rollout(
+        self,
+        policy: BinaryPolicyNetwork,
+        value_fn: ValueNetwork | None,
+        batch_size: int,
+    ) -> RolloutBatch:
+        target_steps = int(max(1, batch_size))
+
+        states_out: list[np.ndarray] = []
+        labels_out: list[float] = []
+        actions_out: list[float] = []
+        logp_out: list[float] = []
+        rewards_out: list[float] = []
+        hours_out: list[float] = []
+        values_out: list[float] = []
+        returns_out: list[float] = []
+        adv_out: list[float] = []
+
+        collected = 0
+        while collected < target_steps:
+            ep_idx = int(self.rng.integers(0, self.n_episodes))
+            row_idx = self.episodes[ep_idx]
+            if row_idx.size == 0:
+                continue
+
+            ep_states = self.states[row_idx]
+            ep_labels = self.labels[row_idx]
+            ep_hours = self.hours[row_idx]
+            s_tf = tf.convert_to_tensor(ep_states, dtype=tf.float32)
+            logits = tf.squeeze(policy(s_tf, training=False), axis=-1).numpy().astype(np.float32)
+            if value_fn is None:
+                values = np.zeros((row_idx.size,), dtype=np.float32)
+            else:
+                values = tf.squeeze(value_fn(s_tf, training=False), axis=-1).numpy().astype(np.float32)
+            probs = sigmoid_np(logits)
+
+            ep_s: list[np.ndarray] = []
+            ep_y: list[float] = []
+            ep_a: list[float] = []
+            ep_logp: list[float] = []
+            ep_r: list[float] = []
+            ep_h: list[float] = []
+            ep_v: list[float] = []
+            ep_done: list[bool] = []
+
+            for t in range(row_idx.size):
+                p = float(np.clip(probs[t], 0.0, 1.0))
+                action = float(self.rng.binomial(1, p))
+                label = float(ep_labels[t])
+                hour = float(ep_hours[t])
+
+                is_last = t == (row_idx.size - 1)
+                terminal = bool(action >= 0.5) or is_last
+
+                if terminal:
+                    reward = float(
+                        compute_rewards(
+                            np.asarray([action], dtype=np.float32),
+                            np.asarray([label], dtype=np.float32),
+                            self.reward_config,
+                            hours=np.asarray([hour], dtype=np.float32),
+                            min_hour=self.min_hour,
+                            max_hour=self.max_hour,
+                        )[0]
+                    )
+                else:
+                    reward = 0.0
+
+                logp = float(bernoulli_log_prob_np(np.asarray([action], dtype=np.float32), np.asarray([logits[t]], dtype=np.float32))[0])
+
+                ep_s.append(ep_states[t].astype(np.float32))
+                ep_y.append(label)
+                ep_a.append(action)
+                ep_logp.append(logp)
+                ep_r.append(reward)
+                ep_h.append(hour)
+                ep_v.append(float(values[t]))
+                ep_done.append(terminal)
+
+                if terminal:
+                    break
+
+            if not ep_s:
+                continue
+
+            ep_returns = np.zeros((len(ep_r),), dtype=np.float32)
+            ret = 0.0
+            for t in range(len(ep_r) - 1, -1, -1):
+                if ep_done[t]:
+                    ret = float(ep_r[t])
+                else:
+                    ret = float(ep_r[t] + self.gamma * ret)
+                ep_returns[t] = ret
+            ep_adv = ep_returns - np.asarray(ep_v, dtype=np.float32)
+
+            states_out.extend(ep_s)
+            labels_out.extend(ep_y)
+            actions_out.extend(ep_a)
+            logp_out.extend(ep_logp)
+            rewards_out.extend(ep_r)
+            hours_out.extend(ep_h)
+            values_out.extend(ep_v)
+            returns_out.extend(ep_returns.tolist())
+            adv_out.extend(ep_adv.tolist())
+            collected += len(ep_s)
+
+        return RolloutBatch(
+            states=np.asarray(states_out, dtype=np.float32),
+            labels=np.asarray(labels_out, dtype=np.float32),
+            actions=np.asarray(actions_out, dtype=np.float32),
+            old_log_probs=np.asarray(logp_out, dtype=np.float32),
+            rewards=np.asarray(rewards_out, dtype=np.float32),
+            hours=np.asarray(hours_out, dtype=np.float32),
+            values=np.asarray(values_out, dtype=np.float32),
+            returns=np.asarray(returns_out, dtype=np.float32),
+            advantages=np.asarray(adv_out, dtype=np.float32),
         )
 
 

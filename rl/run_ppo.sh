@@ -29,10 +29,12 @@ fi
 # Default run settings: generate/reuse synthetic data, run PPO sweep, and summarize.
 CONFIG_PATH="${CONFIG_PATH:-${SCRIPT_DIR}/config_ppo.json}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs}"
-RUN_NAME="${RUN_NAME:-initial_tests_ppo}"
-STAGE="${STAGE:-sweep_small}"
+RUN_NAME="${RUN_NAME:-initial_tests_ppo_newrew_newplots}"
+STAGE="${STAGE:-sweep_wide}"
 TRIAL_INDEX="${TRIAL_INDEX:-0}"
-MAX_TRIALS="${MAX_TRIALS:-1}"
+MAX_TRIALS="${MAX_TRIALS:-2}"
+SHUFFLE_TRIALS="${SHUFFLE_TRIALS:-0}"
+SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 SKIP_EXISTING="${SKIP_EXISTING:-0}"
 STREAM_TRIAL_LOGS="${STREAM_TRIAL_LOGS:-1}"
 OVERWRITE_DATA="${OVERWRITE_DATA:-0}"
@@ -58,6 +60,10 @@ fi
 
 if [[ "${OVERWRITE_DATA}" == "1" ]]; then
   cmd+=(--overwrite-data)
+fi
+
+if [[ "${SHUFFLE_TRIALS}" == "1" ]]; then
+  cmd+=(--shuffle-trials --shuffle-seed "${SHUFFLE_SEED}")
 fi
 
 # Optional simulation overrides via environment variables.
